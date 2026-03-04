@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "M2S2_demo"
+version = "0.1.0"
+description = "Multiscale Multi-species Spatial Signatures"
+license = "MIT"
+requires-python = ">=3.13"
+authors = [
+    { name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
+]
+dependencies = [
+    "chalc~=14.0.0",
+    "tqdm~=4.66",
+    "gudhi~=3.10",
+    "scikit-tda~=1.0",
+    "scikit-learn~=1.6",
+    "scipy~=1.14",
+    "jupyterlab~=4.2",
+    "ipywidgets~=8.1",
+    "shapely~=2.0",
+    "pyarrow~=20.0",
+    "tables~=3.10",
+    "ipykernel~=6.29.5",
+    "ipympl~=0.9",
+]
+
+[tool.setuptools]
+packages = ["utils"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"
+skip-magic-trailing-comma = false
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # "CPY", # flake8-copyright
+    "W191",    # pylint (disallows tab indentation)
+    "D206",    # pydocstyle (disallows tab indentation in docstring)
+    "PLR0913", # refactor (too many arguments in function signature)
+    "ERA",     # commented code
+    "TD002",   # Todo missing author
+    "TD003",   # Todo issue link
+]
+
+[tool.ruff.per-file-ignores]
+"**/__init__.py" = [
+    "F401", # pyflakes: disallows unused imports
+    "F403", # pyflakes: disallows wildcard imports
+]
+
+[tool.ruff.lint.pylint]
+allow-magic-value-types = ["float", "int", "str", "bytes"]

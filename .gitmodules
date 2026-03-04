@@ -1,0 +1,6 @@
+[submodule "dowker_comparison/multiplex_relations"]
+	path = dowker_comparison/multiplex_relations
+	url = https://github.com/irishryoon/multiplex_relations
+[submodule "dowker_comparison/Dowker_persistence"]
+	path = dowker_comparison/Dowker_persistence
+	url = https://github.com/irishryoon/Dowker_persistence
