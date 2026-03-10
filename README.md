@@ -2,8 +2,6 @@
 
 This repository is meant to accompany the paper ["Topology of Multi-species Localization"](http://arxiv.org/abs/2603.032).
 
-WARNING: The repo isn't ready yet, but will be updated in the next few days.
-
 ## Getting started
 The recommended way to set up the project environment is through [uv](https://github.com/astral-sh/uv), which is a tool that can create and manipulate Python virtual environments, manage Python versions, and install Python tools system-wide.
 
@@ -51,44 +49,53 @@ uv sync
 
 All scripts in the rest of these instructions assume that you have performed these steps, and must be run from within the project directory.
 
-## Datasets
+## Synthetic Data from Tumor Microenvironment
 
-## Generating Statistics and Classification Pipeline - Adenoma Dataset
+The following commands perform the analysis on the synthetic tumor microenvironment dataset, including downloading the data, generating persistent statistics for all singles, pairs, and triples, and running the clustering using those statistics.
+```bash
+cd abm_dataset_analysis || exit 1
+
+# Download the dataset.
+uv run python download_data.py
+
+# Generate the persistent statistics for all singles, pairs, and triples.
+uv run python generate_stats.py
+
+# Run the clustering
+uv run python eee_clustering.py
+
+```
+The notebooks `abm_dataset_analysis/generate_example_figures.ipynb` and `abm_dataset_analysis/plot_results.ipynb` contain code to generate the plots in the paper from the results of this analysis.
+
+## Colorectal Cancer Dataset
+
+The following commands perform the analysis on the colorectal cancer dataset, including downloading the data, generating persistent statistics for all singles, pairs and triples, and running the analysis using those statistics.
 
 ```bash
-# Generate persistent statistics for all celltype pairs.
-uv run adenoma_carcinoma_pipeline/scripts/generate_stats.py \
+cd colorectal_cancer_dataset || exit 1
+
+# Download the dataset.
+uv run python download_data.py
+
+# Generate persistent statistics for all singles and pairs.
+uv run python generate_stats.py \
     --max-num-labels 2 \
-    --output-dir adenoma_carcinoma_pipeline/stats_singles_and_pairs
+    --output-dir stats_singles_and_pairs
 
-# Run the classification using the persistent statistics from celltype pairs.
-uv run classification/scripts/classification_by_patient_pca.py \
-    --stats-dirs adenoma_carcinoma_pipeline/stats_singles_and_pairs \
-    --output-file classification/results/pairs.h5
+# Run the classification using the persistent statistics from singles and pairs.
+uv run python classification_by_patient_pca.py \
+    --stats-dirs stats_singles_and_pairs \
+    --output-file results/without_triples.h5
 
-# Run the classification using the persistent statistics from celltype pairs
-# and ignoring epithelium.
-uv run classification/scripts/classification_by_patient_pca.py \
-    --stats-dirs adenoma_carcinoma_pipeline/stats_singles_and_pairs \
-    --discard-epithelium \
-    --output-file adenoma_carcinoma_pipeline/results/pairs_noepi.h5
-
-# Generate persistent statistics for all celltype triples only.
+# Generate persistent statistics for all triples.
 uv run classification/scripts/generate_stats.py \
     --max-num-labels 3 \
     --min-num-labels 3 \
-    --output-dir adenoma_carcinoma_pipeline/stats_triples
+    --output-dir stats_triples
 
-# Run the classification using the persistent statistics from celltype pairs
-# and triples.
+# Run the classification using the persistent statistics from singles, pairs and triples.
 uv run classification/scripts/classification_by_patient_pca.py \
-    --stats-dirs adenoma_carcinoma_pipeline/stats_singles_and_pairs adenoma_carcinoma_pipeline/stats_triples \
-    --output-file adenoma_carcinoma_pipeline/results/pairs_and_triples.h5
-
-# Run the classification using the persistent statistics from celltype pairs
-# and triples, and ignoring epithelium.
-uv run classification/scripts/classification_by_patient_pca.py \
-    --stats-dirs adenoma_carcinoma_pipeline/stats_singles_and_pairs adenoma_carcinoma_pipeline/stats_triples \
-    --discard-epithelium \
-    --output-file adenoma_carcinoma_pipeline/results/pairs_and_triples_noepi.h5
+    --stats-dirs stats_singles_and_pairs stats_triples \
+    --output-file results/with_triples.h5
 ```
+The notebook `colorectal_cancer_dataset_analysis/plot_results.ipynb` contains code to generate the plots in the paper from the results of these analyses.

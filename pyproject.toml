@@ -57,6 +57,12 @@ ignore = [
     "F401", # pyflakes: disallows unused imports
     "F403", # pyflakes: disallows wildcard imports
 ]
+"colorectal_cancer_dataset_analysis/download_data.py" = [
+    "T201" # print statement found
+]
+"abm_dataset_analysis/download_data.py" = [
+    "T201" # print statement found
+]
 
 [tool.ruff.lint.pylint]
 allow-magic-value-types = ["float", "int", "str", "bytes"]

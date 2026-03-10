@@ -31,7 +31,8 @@ __all__ = ["generate_stats", "make_cmdline_parser", "make_filename_index_map"]
 
 
 def default_data_loader(
-    filepath: Path, _: dict[str, Any],
+    filepath: Path,
+    _: dict[str, Any],
 ) -> tuple[DataFrame, dict[str, Any]]:
     return (read_csv(filepath, header=0, index_col=False), {})
 
@@ -40,7 +41,8 @@ def generate_stats(
     cmdline_args: argparse.Namespace,
     filename_index_map: Mapping[str, dict[str, Any]],
     data_loader: Callable[
-        [Path, dict[str, Any]], tuple[DataFrame, dict[str, Any]],
+        [Path, dict[str, Any]],
+        tuple[DataFrame, dict[str, Any]],
     ] = default_data_loader,
 ) -> int:
     """Compute persistent statistics for all pairs of labels from datasets of labelled 2D data.
@@ -336,21 +338,18 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
         "Dataset-specific options": {
             "--x-column": {
                 "action": "store",
-                "nargs": "?",
                 "default": "x",
                 "type": str,
                 "help": "The column name for the x-coordinate.",
             },
             "--y-column": {
                 "action": "store",
-                "nargs": "?",
                 "default": "y",
                 "type": str,
                 "help": "The column name for the y-coordinate.",
             },
             "--label-column": {
                 "action": "store",
-                "nargs": "?",
                 "default": "label",
                 "type": str,
                 "help": "The column giving the label of the point.",
@@ -375,21 +374,18 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
         "Algorithm options": {
             "--max-num-labels": {
                 "action": "store",
-                "nargs": "?",
                 "default": 3,
                 "type": int,
                 "help": "The maximum number of labels to consider per combination.",
             },
             "--min-num-labels": {
                 "action": "store",
-                "nargs": "?",
                 "default": 1,
                 "type": int,
                 "help": "The minimum number of labels to consider per combination.",
             },
             "--max-diagram-dimension": {
                 "action": "store",
-                "nargs": "?",
                 "default": 1,
                 "type": int,
                 "choices": (0, 1),
@@ -397,7 +393,6 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
             },
             "--filtration-algorithm": {
                 "action": "store",
-                "nargs": "?",
                 "default": "delaunay_cech",
                 "type": str,
                 "choices": ("delaunay_rips", "delaunay_cech", "alpha"),
@@ -405,7 +400,6 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
             },
             "--min-count": {
                 "action": "store",
-                "nargs": "?",
                 "default": 3,
                 "type": int,
                 "help": "If any label class has fewer than this many representatives "
@@ -415,7 +409,6 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
         "Logging options": {
             "--verbosity": {
                 "action": "store",
-                "nargs": "?",
                 "default": "INFO",
                 "type": str,
                 "choices": ("DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"),
@@ -424,8 +417,6 @@ def make_cmdline_parser(overrides: dict[str, dict]) -> argparse.ArgumentParser:
             },
             "--logfile-dir": {
                 "action": "store",
-                "nargs": "?",
-                "default": "logs",
                 "type": str,
                 "help": "Directory where log files will be saved.",
             },
