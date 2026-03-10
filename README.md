@@ -1,4 +1,4 @@
-# Demo of the Multiscale Multi-species Spatial Signatures Pipeline
+# Demo of the Multiscale Multi-species Spatial Signatures (M$^2$S$^2$) Pipeline
 
 This repository is meant to accompany the paper ["Topology of Multi-species Localization"](http://arxiv.org/abs/2603.032).
 
