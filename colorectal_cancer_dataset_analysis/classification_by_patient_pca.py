@@ -9,22 +9,107 @@ import pprint
 import time
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.linalg import svd
+
+# from scipy.linalg import svd
+from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import StratifiedShuffleSplit, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
 from utils.logging import configure_logger
 from utils.read_stats import discard_feature, normalize_colname, read_stats
 
 plt.style.use("seaborn-v0_8-darkgrid")
+
+
+class GroupwisePCA:
+    """Run PCA on the features from each cell group separately."""
+
+    def __init__(self) -> None:
+        """Initialize the estimator."""
+        self.models = {}
+
+    def fit(self, data: pd.DataFrame) -> Self:
+        """Compute the PCA projection operators of each cell group from input data."""
+        cell_groups = sorted({column[3] for column in data.columns})
+
+        for cell_group in cell_groups:
+            columns = [column for column in data.columns if column[3] == cell_group]
+
+            n_features = len(columns)
+
+            # At most 5% of features, at least min(5, n_features) features
+            n_components = max(
+                math.ceil(0.05 * n_features),
+                min(n_features, 5),
+            )
+            # Respect the training-sample rank.
+            n_components = min(
+                n_components,
+                n_features,
+                max(1, len(data) - 1),
+            )
+
+            pipeline = Pipeline(
+                [
+                    (
+                        "standardization",
+                        StandardScaler(),
+                    ),
+                    (
+                        "pca",
+                        PCA(n_components=n_components),
+                    ),
+                ],
+            )
+
+            pipeline.fit(data.loc[:, columns])
+
+            self.models[cell_group] = {
+                "columns": columns,
+                "pipeline": pipeline,
+                "n_components": n_components,
+            }
+
+        return self
+
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Project each cell group in the input data onto the computed principal components."""
+        transformed_groups = []
+
+        for cell_group, model_info in self.models.items():
+            columns = model_info["columns"]
+            pipeline = model_info["pipeline"]
+
+            values = pipeline.transform(data.loc[:, columns])
+
+            transformed_columns = pd.MultiIndex.from_tuples(
+                [(cell_group, f"pca_{component}") for component in range(values.shape[1])],
+                names=["cell_group", "component"],
+            )
+
+            transformed_groups.append(
+                pd.DataFrame(
+                    values,
+                    index=data.index,
+                    columns=transformed_columns,
+                ),
+            )
+
+        return pd.concat(transformed_groups, axis=1)
+
+    def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Project each cell group in the input data onto the corresponding principal components."""
+        return self.fit(data).transform(data)
 
 
 def get_patient_ids(
@@ -114,23 +199,22 @@ def read_patient_data_combined(
     return pd.concat(patient_data_list, axis=1)
 
 
-def pca(
-    data: pd.DataFrame,
-    n_components: int,
-) -> pd.DataFrame:
-    """Run PCA on the data and return the transformed data and the PCA object."""
-    data_array = data.to_numpy()
-    data_mean = np.mean(data_array, axis=0)
-    data_centred = data - data_mean
-    (_, _, v) = svd(data_centred, lapack_driver="gesvd")
-    data_pca = data_centred @ v[:, 0:n_components] + data_mean[0:n_components]
-    return pd.DataFrame(data_pca)
+# def pca(
+#     data: pd.DataFrame,
+#     n_components: int,
+# ) -> pd.DataFrame:
+#     """Run PCA on the data and return the transformed data and the PCA object."""
+#     data_array = data.to_numpy()
+#     data_mean = np.mean(data_array, axis=0)
+#     data_centred = data - data_mean
+#     (_, _, v) = svd(data_centred, lapack_driver="gesvd")
+#     data_pca = data_centred @ v[:, 0:n_components] + data_mean[0:n_components]
+#     return pd.DataFrame(data_pca)
 
 
 def classification_preprocess(
     data: pd.DataFrame,
     *,
-    imputer_params: dict[str, Any],
     keep_epithelium: bool,
 ) -> tuple[pd.DataFrame, float]:
     """Preprocess the data from a single patient for classification.
@@ -142,7 +226,11 @@ def classification_preprocess(
     The data is replaced by the PCA projection.
 
     """
-    imputer = SimpleImputer(**imputer_params)
+    imputer = SimpleImputer(
+        strategy="constant",
+        fill_value=0,
+        keep_empty_features=True,
+    )
 
     # Drop epithelium columns if they are not required
     if not keep_epithelium:
@@ -166,34 +254,12 @@ def classification_preprocess(
     # Impute missing values
     data = pd.DataFrame(imputer.fit_transform(data), columns=data.columns)
 
-    # Compute the PCA per feature group
-    cell_groups: list[tuple[str, ...]] = list({c[-1] for c in data.columns})
-
-    def n_components(n: int) -> int:
-        """Return the number of components to keep for PCA."""
-        return max(math.ceil(n * 0.05), min(n, 5))
-
-    logger = logging.getLogger(__name__)
-    data_new = pd.DataFrame()
-    for cell_group in cell_groups:
-        logger.debug("Running PCA for cell group %s", cell_group)
-        cell_group_columns = [c for c in data.columns if c[-1] == cell_group]
-        data_cell_group = data.loc[:, cell_group_columns]
-        cell_group_pca = pca(data_cell_group, n_components(data_cell_group.shape[1]))
-        data = data.drop(columns=cell_group_columns)
-        new_colnames = [(cell_group, "pca_" + str(i)) for i in range(cell_group_pca.shape[1])]
-        data_cell_group_new = pd.DataFrame(cell_group_pca)
-        data_cell_group_new.columns = new_colnames
-        data_new = pd.concat([data_new, data_cell_group_new], axis=1)
-
-    data = pd.concat([data, data_new], axis=1)
     return data, avg_perc_features
 
 
 def run_classification_single_patient(
     data: pd.DataFrame,
     *,
-    imputer_params: dict[str, Any],
     gradient_boosting_classifier_params: dict[str, Any],
     bagging_classifier_params: dict[str, Any],
     splitter_params: dict[str, Any],
@@ -205,7 +271,7 @@ def run_classification_single_patient(
     gbc = GradientBoostingClassifier(
         **gradient_boosting_classifier_params,
     )
-    estimator = BaggingClassifier(gbc, **bagging_classifier_params)
+    classifier = BaggingClassifier(gbc, **bagging_classifier_params)
     splitter = StratifiedShuffleSplit(**splitter_params)
     baseline_estimator = DummyClassifier()
 
@@ -222,9 +288,12 @@ def run_classification_single_patient(
     # Preprcess the data
     data, avg_perc_features = classification_preprocess(
         data,
-        imputer_params=imputer_params,
         keep_epithelium=keep_epithelium,
     )
+
+    # Compute the PCA per feature group
+    logger = logging.getLogger(__name__)
+    estimator = Pipeline([("pca", GroupwisePCA()), ("classification", classifier)])
 
     # Train a classifier on the data and cross-validate
     cv_scores = cross_validate(
@@ -239,7 +308,10 @@ def run_classification_single_patient(
     cv_balanced_accuracy = np.mean(cv_scores["test_balanced_accuracy"])
     estimator = estimator.fit(data, y)
     mdi_vec = np.mean(
-        np.stack([e.feature_importances_ for e in estimator.estimators_], axis=0),
+        np.stack(
+            [e.feature_importances_ for e in estimator.named_steps["classification"].estimators_],
+            axis=0,
+        ),
         axis=0,
     )
     return {
@@ -285,16 +357,10 @@ def run_classification_all_patients(
         "test_size": 0.3,
         "random_state": 0,
     }
-    imputer_params = {
-        "strategy": "constant",
-        "fill_value": 0.0,
-        "keep_empty_features": True,
-    }
     all_params = {
         "GradientBoostingClassifier": gradient_boosting_classifier_params,
         "BaggingClassifier": bagging_classifier_params,
         "StratifiedShuffleSplit": splitter_params,
-        "SimpleImputer": imputer_params,
     }
     logger.info(
         "Using the following classifier parameters:\n%s",
@@ -317,7 +383,6 @@ def run_classification_all_patients(
 
         result = run_classification_single_patient(
             data,
-            imputer_params=imputer_params,
             gradient_boosting_classifier_params=gradient_boosting_classifier_params,
             bagging_classifier_params=bagging_classifier_params,
             splitter_params=splitter_params,
@@ -365,7 +430,7 @@ if __name__ == "__main__":
     def valid_directory(path: str) -> Path:
         """Check if the directory exists."""
         p = Path(path)
-        if not p.exists:
+        if not p.is_dir():
             msg = f"Path does not exist: {path}"
             raise argparse.ArgumentTypeError(msg)
         return p
@@ -449,7 +514,8 @@ if __name__ == "__main__":
         parser.add_argument(k, **v)
     args = parser.parse_args()
     if args.num_workers == 0:
-        args.num_workers = len(os.sched_getaffinity(0))
+        cpu_count = os.cpu_count()
+        args.num_workers = cpu_count - 1 if cpu_count is not None else 1
     logger = _init_logging(args)
     logger.debug("Provided arguments:\n%s", pprint.pformat(vars(args)))
     labels_include = args.labels_include or ()
@@ -458,7 +524,7 @@ if __name__ == "__main__":
         stats_dirs=args.stats_dirs,
         labels_include=labels_include,
         labels_exclude=labels_exclude,
-        keep_epithelium=args.keep_epithlium,
+        keep_epithelium=args.keep_epithelium,
         num_workers=args.num_workers,
     )
     logger.info(
