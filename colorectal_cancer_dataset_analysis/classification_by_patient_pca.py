@@ -7,6 +7,7 @@ import math
 import os
 import pprint
 import time
+from collections.abc import Callable
 from os import PathLike
 from pathlib import Path
 from typing import Any, Self
@@ -21,7 +22,7 @@ from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import brier_score_loss
+from sklearn.metrics import brier_score_loss, make_scorer
 from sklearn.model_selection import (
     StratifiedKFold,
     cross_validate,
@@ -250,6 +251,45 @@ def classification_preprocess(
     return data, avg_perc_features
 
 
+def compute_feature_importance_from_cv_result(
+    data: pd.DataFrame,
+    target: np.ndarray[tuple[int], np.dtype[np.floating]],
+    cv_result: dict,
+    cell_groups: np.ndarray[tuple[int]],
+    scorer: Callable[[np.ndarray, np.ndarray], float],
+    perms: np.ndarray[tuple[int, int], np.dtype[np.integer]],
+) -> tuple[float, dict[str, float]]:
+    """Compute the out-of-fold prediction score and permuted feature importances after cross-validation."""  # noqa: E501
+    estimators = cv_result["estimator"]
+    test_indices = cv_result["indices"]["test"]
+    cv_score = np.mean(cv_result["test_score"])
+    group_importances = dict.fromkeys(cell_groups, 0.0)
+
+    # TODO: parallelise across num_workers threads
+    for cell_group in tqdm(cell_groups, desc="Cell group", keep=False):
+        group_importance = 0
+        columns = [c for c in data.columns if c[-1] == cell_group]
+
+        for perm in tqdm(perms, desc="Permutation", keep=False):
+            data_permuted = data.copy()
+            data_permuted.loc[:, columns] = data_permuted[columns].to_numpy()[perm]
+            oof_predictions = np.empty(len(target), dtype=float)
+
+            for estimator, idx in zip(estimators, test_indices, strict=True):
+                data_test = data_permuted.iloc[idx]
+                # predict_proba gives a row of [Pr(0), Pr(1)] for each observation
+                oof_predictions[idx] = estimator.predict_proba(data_test)[:, 1]
+
+            # Compute the drop in score
+            perm_score = scorer(oof_predictions, target)
+            group_importance += cv_score - perm_score
+
+        group_importance /= len(perms)
+        group_importances[cell_group] = group_importance
+
+    return cv_score, group_importances
+
+
 def run_classification_single_patient(
     data: pd.DataFrame,
     *,
@@ -288,44 +328,46 @@ def run_classification_single_patient(
     # Pre-compute the row permutations
     rng = np.random.default_rng(0)
     perms = np.array([rng.permutation(data.shape[0]) for j in range(permutations)])
-    scores = np.zeros(50, dtype=float)
-    feature_importances = dict.fromkeys(cell_groups, np.empty(repetitions))
-    for rep in range(repetitions):
+    scores = np.empty(repetitions, dtype=float)
+    group_importance_distributions = dict.fromkeys(cell_groups, np.empty(repetitions, dtype=float))
+
+    def score_func(target: np.ndarray, pred: np.ndarray) -> float:
+        return 1.0 - brier_score_loss(target, pred)
+
+    scorer = make_scorer(
+        score_func,
+        greater_is_better=False,
+        response_method="predict_proba",
+    )
+
+    for rep in tqdm(np.arange(repetitions), desc="Cross-validation repetition", keep=False):
         n_splits = splitter.get_n_splits(X=data, y=y)
         results = cross_validate(
             estimator,
             data,
             y,
-            scoring="neg_brier_score",
+            scoring=scorer,
             cv=splitter,
             n_jobs=n_splits,
             return_estimator=True,
             return_indices=True,
         )
-        scores[rep] = 1 + np.mean(results["test_score"])  # Brier loss can be aggregated
-        estimators = results["estimator"]
-        test_indices = results["indices"]["test"]
+        score, group_importances = compute_feature_importance_from_cv_result(
+            data=data,
+            target=y,
+            cv_result=results,
+            cell_groups=cell_groups,
+            scorer=score_func,
+            perms=perms,
+        )
+        scores[rep] = score
         for cell_group in cell_groups:
-            imp = 0
-            for perm in perms:
-                columns = [c for c in data.columns if c[-1] == cell_group]
-                data_permuted = data.copy()
-                data_permuted.loc[:, columns] = data_permuted[columns].to_numpy()[perm]
-                oof_predictions = np.empty(len(y), dtype=float)
-                for estimator, idx in zip(estimators, test_indices, strict=True):
-                    data_test = data_permuted.iloc[idx]
-                    # predict_proba gives a row of [Pr(0), Pr(1)] for each observation
-                    oof_predictions[idx] = estimator.predict_proba(data_test)[:, 1]
-                # Compute the drop in score
-                score = 1 - brier_score_loss(oof_predictions, y)
-                imp += scores[rep] - score
-            imp /= len(perms)
-            feature_importances[cell_group][rep] = imp
+            group_importance_distributions[cell_group][rep] = group_importances[cell_group]
 
     return {
         "baseline": baseline,
         "scores": scores,
-        "feature_importances": feature_importances,
+        "feature_importances": group_importance_distributions,
         "num_samples": data.shape[0],
         "avg_perc_features": avg_perc_features,
     }
@@ -345,7 +387,7 @@ def run_classification_all_patients(
 
     classification_results_list = []
     patient_ids = get_patient_ids(stats_dirs[0])
-    for patient_id in tqdm(patient_ids):
+    for patient_id in tqdm(patient_ids, desc="Patients"):
         logger.debug(
             "Running classification for patient_id: %s",
             patient_id,
