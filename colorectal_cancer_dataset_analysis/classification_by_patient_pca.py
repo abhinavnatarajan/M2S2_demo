@@ -14,13 +14,18 @@ from typing import Any, Self
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
 
 # from scipy.linalg import svd
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import StratifiedShuffleSplit, cross_validate
+from sklearn.metrics import brier_score_loss
+from sklearn.model_selection import (
+    StratifiedKFold,
+    cross_validate,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
@@ -177,6 +182,7 @@ def read_patient_data(
         discard_columns += [
             c for c in patient_data.columns if set(c[-1]).intersection(labels_exclude)
         ]
+    # Output features are indexed by (diagram, homological dim, statistic, cell_group)
     return patient_data.drop(columns=discard_columns)
 
 
@@ -197,19 +203,6 @@ def read_patient_data_combined(
         for p in stat_dump_dirs
     ]
     return pd.concat(patient_data_list, axis=1)
-
-
-# def pca(
-#     data: pd.DataFrame,
-#     n_components: int,
-# ) -> pd.DataFrame:
-#     """Run PCA on the data and return the transformed data and the PCA object."""
-#     data_array = data.to_numpy()
-#     data_mean = np.mean(data_array, axis=0)
-#     data_centred = data - data_mean
-#     (_, _, v) = svd(data_centred, lapack_driver="gesvd")
-#     data_pca = data_centred @ v[:, 0:n_components] + data_mean[0:n_components]
-#     return pd.DataFrame(data_pca)
 
 
 def classification_preprocess(
@@ -260,19 +253,14 @@ def classification_preprocess(
 def run_classification_single_patient(
     data: pd.DataFrame,
     *,
-    gradient_boosting_classifier_params: dict[str, Any],
-    bagging_classifier_params: dict[str, Any],
-    splitter_params: dict[str, Any],
+    classifier: BaseEstimator,
+    splitter: StratifiedKFold,
+    repetitions: int,
+    permutations: int,
     keep_epithelium: bool,
-    n_jobs_crossval: int,
 ) -> dict[str, Any]:
     """Run classification for a single patient."""
     # Check if the target has only samples of a given type
-    gbc = GradientBoostingClassifier(
-        **gradient_boosting_classifier_params,
-    )
-    classifier = BaggingClassifier(gbc, **bagging_classifier_params)
-    splitter = StratifiedShuffleSplit(**splitter_params)
     baseline_estimator = DummyClassifier()
 
     # Prediction target
@@ -291,36 +279,56 @@ def run_classification_single_patient(
         keep_epithelium=keep_epithelium,
     )
 
+    cell_groups = np.unique([c[-1] for c in data.columns])
+
     # Compute the PCA per feature group
-    logger = logging.getLogger(__name__)
     estimator = Pipeline([("pca", GroupwisePCA()), ("classification", classifier)])
 
     # Train a classifier on the data and cross-validate
-    cv_scores = cross_validate(
-        estimator,
-        data,
-        y,
-        scoring=["accuracy", "balanced_accuracy"],
-        cv=splitter,
-        n_jobs=n_jobs_crossval,
-    )
-    cv_accuracy = np.mean(cv_scores["test_accuracy"])
-    cv_balanced_accuracy = np.mean(cv_scores["test_balanced_accuracy"])
-    estimator = estimator.fit(data, y)
-    mdi_vec = np.mean(
-        np.stack(
-            [e.feature_importances_ for e in estimator.named_steps["classification"].estimators_],
-            axis=0,
-        ),
-        axis=0,
-    )
+    # Pre-compute the row permutations
+    rng = np.random.default_rng(0)
+    perms = np.array([rng.permutation(data.shape[0]) for j in range(permutations)])
+    scores = np.zeros(50, dtype=float)
+    feature_importances = dict.fromkeys(cell_groups, np.empty(repetitions))
+    for rep in range(repetitions):
+        n_splits = splitter.get_n_splits(X=data, y=y)
+        results = cross_validate(
+            estimator,
+            data,
+            y,
+            scoring="neg_brier_score",
+            cv=splitter,
+            n_jobs=n_splits,
+            return_estimator=True,
+            return_indices=True,
+        )
+        scores[rep] = 1 + np.mean(results["test_score"])  # Brier loss can be aggregated
+        estimators = results["estimator"]
+        test_indices = results["indices"]["test"]
+        for cell_group in cell_groups:
+            imp = 0
+            for perm in perms:
+                columns = [c for c in data.columns if c[-1] == cell_group]
+                data_permuted = data.copy()
+                data_permuted.loc[:, columns] = data_permuted[columns].to_numpy()[perm]
+                oof_predictions = np.empty(len(y), dtype=float)
+                for estimator, idx in zip(estimators, test_indices, strict=True):
+                    data_test = data_permuted.iloc[idx]
+                    # predict_proba gives a row of [Pr(0), Pr(1)] for each observation
+                    oof_predictions[idx] = estimator.predict_proba(data_test)[:, 1]
+                # Compute the drop in score
+                score = 1 - brier_score_loss(oof_predictions, y)
+                imp += scores[rep] - score
+            imp /= len(perms)
+            feature_importances[cell_group][rep] = imp
+
     return {
         "baseline": baseline,
-        "cv_mean_accuracy": cv_accuracy.item(),
-        "cv_mean_balanced_accuracy": cv_balanced_accuracy.item(),
+        "scores": scores,
+        "feature_importances": feature_importances,
         "num_samples": data.shape[0],
         "avg_perc_features": avg_perc_features,
-    } | dict(zip(data.columns, mdi_vec.tolist(), strict=True))
+    }
 
 
 def run_classification_all_patients(
@@ -334,38 +342,6 @@ def run_classification_all_patients(
     """Run classification for each patient."""
     logger = logging.getLogger(__name__)
     logger.info("Starting classification.")
-    n_crossval_splits = 10
-    n_jobs_crossval = min(n_crossval_splits, num_workers)
-    gradient_boosting_classifier_params = {
-        "loss": "log_loss",
-        "n_estimators": 25,
-        "learning_rate": 0.4,
-        "max_features": 0.03,
-        "max_depth": 3,
-        "max_leaf_nodes": 6,
-        "min_samples_leaf": 5,
-    }
-    bagging_classifier_params = {
-        "n_estimators": 500,
-        "n_jobs": max(1, int(num_workers / n_jobs_crossval)),
-        "max_samples": 1.0,
-        "bootstrap": False,
-        "random_state": 0,
-    }
-    splitter_params = {
-        "n_splits": n_crossval_splits,
-        "test_size": 0.3,
-        "random_state": 0,
-    }
-    all_params = {
-        "GradientBoostingClassifier": gradient_boosting_classifier_params,
-        "BaggingClassifier": bagging_classifier_params,
-        "StratifiedShuffleSplit": splitter_params,
-    }
-    logger.info(
-        "Using the following classifier parameters:\n%s",
-        pprint.pformat(all_params),
-    )
 
     classification_results_list = []
     patient_ids = get_patient_ids(stats_dirs[0])
@@ -381,13 +357,33 @@ def run_classification_all_patients(
             patient_id.item(),
         )
 
+        gbc = GradientBoostingClassifier(
+            loss="log_loss",
+            n_estimators=25,
+            learning_rate=0.4,
+            max_features=0.03,
+            max_depth=3,
+            max_leaf_nodes=6,
+            min_samples_leaf=5,
+        )
+        classifier = BaggingClassifier(
+            gbc,
+            n_estimators=500,
+            n_jobs=max(1, int(num_workers / 10)),
+            max_samples=1.0,
+            bootstrap=False,
+            random_state=0,
+        )
+        splitter = StratifiedKFold(n_splits=8, random_state=0)
+        repetitions = 50
+        permutations = 30
         result = run_classification_single_patient(
             data,
-            gradient_boosting_classifier_params=gradient_boosting_classifier_params,
-            bagging_classifier_params=bagging_classifier_params,
-            splitter_params=splitter_params,
+            classifier=classifier,
+            splitter=splitter,
+            repetitions=repetitions,
+            permutations=permutations,
             keep_epithelium=keep_epithelium,
-            n_jobs_crossval=n_jobs_crossval,
         )
         if len(result) > 0:
             classification_results_list.append(
@@ -489,6 +485,28 @@ if __name__ == "__main__":
         "--keep-epithelium": {
             "action": "store_true",
             "help": "Whether to use epithelium cells in the classification.",
+        },
+        "--crossval-splits": {
+            "type": int,
+            "default": 5,
+            "help": "Number of folds in each repetition of cross-validation.",
+        },
+        "--crossval-repetitions": {
+            "type": int,
+            "default": 50,
+            "help": "Number of repetitions for cross-validation.",
+        },
+        "--crossval-permutations": {
+            "type": int,
+            "default": 30,
+            "help": "Number of permutations to use for computing "
+            "grouped permutation importance scores. "
+            "In each repetition of cross-validation, "
+            "each feature group is permuted this many times."
+            "An out-of-fold prediction, is obtained after each permutation "
+            "and prediction loss is averaged across permutations. "
+            "This yields a matrix of importance scores of shape "
+            "[feature_group, repetition_index].",
         },
         "--num-workers": {
             "default": 0,

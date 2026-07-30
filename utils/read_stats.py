@@ -85,7 +85,7 @@ def normalize_colname(name: tuple[str, str]) -> tuple[str, int, str, tuple[str, 
     """
     stat_name = name[0]
     cod_types = name[1]
-    return (*stat_name_split(stat_name), tuple(cod_types.split("/")))
+    return (*stat_name_split(stat_name), tuple(sorted(cod_types.split("/"))))
 
 
 def discard_feature(dgm: str, dim: int, statistic: str, cell_group: tuple[str, ...]) -> bool:
