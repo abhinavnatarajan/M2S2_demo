@@ -349,14 +349,14 @@ def run_classification_single_patient(
                 )
                 for cell_group in cell_groups
             ]
-        for future in tqdm(
-            as_completed(group_importances_futures),
-            desc="Cell group",
-            total=len(cell_groups),
-            keep=False,
-        ):
-            cell_group, cell_group_importance = future.result()
-            group_importance_distributions[cell_group][rep] = cell_group_importance
+            for future in tqdm(
+                as_completed(group_importances_futures),
+                desc="Cell group",
+                total=len(cell_groups),
+                keep=False,
+            ):
+                cell_group, cell_group_importance = future.result()
+                group_importance_distributions[cell_group][rep] = cell_group_importance
 
     return {
         "baseline": baseline,
