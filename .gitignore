@@ -18,3 +18,5 @@ __pycache__
 **/scratch.*
 .venv
 .ruff_cache
+/colorectal_cancer_dataset_analysis/stats_singles_and_pairs
+/colorectal_cancer_dataset_analysis/stats_triples
