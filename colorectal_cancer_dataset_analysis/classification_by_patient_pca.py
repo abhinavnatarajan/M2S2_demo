@@ -7,7 +7,7 @@ import math
 import os
 import pprint
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from os import PathLike
@@ -17,6 +17,8 @@ from typing import Any, Self
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import polars as pl
+import polars.selectors as cs
 from sklearn.base import BaseEstimator
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
@@ -29,9 +31,15 @@ from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
 
 from utils.logging import configure_logger
-from utils.read_stats import discard_feature, normalize_colname, read_stats
+from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
 
 plt.style.use("seaborn-v0_8-darkgrid")
+
+__all__ = [
+	"get_patient_ids",
+	"read_patient_data",
+	"run_classification_single_patient",
+]
 
 
 class GroupwisePCA(BaseEstimator):
@@ -116,17 +124,19 @@ class GroupwisePCA(BaseEstimator):
 
 
 def get_patient_ids(
-	stat_dump_dir: PathLike,
+	*stat_dump_dirs: PathLike,
 ) -> np.ndarray[tuple[int], np.dtype[np.int64]]:
 	"""Retrieve the list of patient IDs from the saved stats."""
 	logging.getLogger(__name__).info("Reading list of patient IDs.")
 	# Read the dataset
-	stat_dump_dir = Path(stat_dump_dir)
 	return (
-		read_stats(stat_dump_dir)
-		.read(columns=["patient_id"])
-		.to_pandas()
-		.drop_duplicates()["patient_id"]
+		pl.scan_parquet([Path(path) for path in stat_dump_dirs], hive_partitioning=True)
+		.select(
+			"patient_id",
+		)
+		.unique()
+		.collect()
+		.get_column("patient_id")
 		.to_numpy()
 		.astype(int)
 	)
@@ -135,80 +145,74 @@ def get_patient_ids(
 # Read the patient tables
 def read_patient_data(
 	*,
-	stat_dump_dir: PathLike,
+	stat_dump_dirs: Sequence[PathLike],
 	patient_id: int,
 	labels_include: tuple[str, ...] = (),
 	labels_exclude: tuple[str, ...] = (),
 	keep_epithelium: bool = False,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
 	"""Read the data for a given patient."""
-	logging.getLogger().debug("Reading data for patient id %s from %s.", patient_id, stat_dump_dir)
-	patient_data: pd.DataFrame = (
-		read_stats(stat_dump_dir, filters=[("patient_id", "=", patient_id)])
-		.read()
-		.to_pandas()
-		.drop(
-			columns=[
-				"filtration_algorithm",  # all are delcech
-				"patient_id",  # entire table is only one patient
-			],
-		)
-		# Drop rows that have empty codomain
-		# These correspond to samples with at most one cell type having more than 3 cells
-		.dropna(subset=["codomain"])
-	)
-	# Convert the codomain to a string
-	patient_data["codomain"] = pd.Series(
-		["/".join(sorted(cod_types)) for cod_types in patient_data["codomain"]],
-		dtype="string",
-		index=patient_data.index,  # otherwise will get weird jumps
-	)
-
-	# Pivot the table by codomain
-	patient_data = patient_data.pivot_table(
-		index=["sample_id", "sample_type"],
-		columns=["codomain"],
-		observed=False,
-	)
-
 	# Drop epithelium columns if they are not required
 	if not keep_epithelium:
 		labels_exclude += ("Epithelium (imm)", "Epithelium (str)")
 
-	patient_data.columns = [normalize_colname(c) for c in patient_data.columns]
-	discard_columns = [c for c in patient_data.columns if discard_feature(*c)]
-	if labels_include:
-		discard_columns += [
-			c for c in patient_data.columns if not set(c[-1]).issubset(labels_include)
-		]
-	if labels_exclude:
-		discard_columns += [
-			c for c in patient_data.columns if set(c[-1]).intersection(labels_exclude)
-		]
-	# Output features are indexed by (diagram, homological dim, statistic, cell_group)
-	return patient_data.drop(columns=discard_columns)
+	# Filters a row based on the codomain cell group
+	filter_labels_include = pl.col("codomain").list.set_difference(labels_include).list.len().eq(0)
+	filter_labels_exclude = (
+		pl.col("codomain").list.set_intersection(labels_exclude).list.len().eq(0)
+	)
 
+	# Some columns can be universally dropped without filtering the cell-groups.
+	# We can do this pre-pivot to save time.
+	dgm_names = r"(ker|cok|dom|cod|im|rel)"
+	pers_stats_names = rf"({('|').join(PERS_STATS_NAMES)})"
+	statistic_names = rf"({('|').join(STATISTIC_NAMES)})"
+	# Codomain and relative diagrams
+	cod_dgm = cs.matches(rf"cod\d+-{pers_stats_names}$")
+	rel_dgm = cs.matches(rf"rel\d+-{pers_stats_names}$")
+	cod_or_rel = cod_dgm | rel_dgm
+	# Cokernel in degree 0
+	cokernel_dim0 = cs.matches(rf"cok0-{pers_stats_names}$")
+	# Births are always 0 in dom0 and im0
+	# Midpts and length not required since we have death.
+	redundant_dim0_stats = cs.matches(rf"^(dom|im)0-{statistic_names}_(birth|midpt|length)$")
+	# Interquartile range not needed since we have p25 and p75
+	iqr = cs.matches(rf"^{dgm_names}\d+-iqr$")
+	pre_pivot_drop_cols = cod_or_rel | cokernel_dim0 | redundant_dim0_stats | iqr
 
-def read_patient_data_combined(
-	*,
-	stat_dump_dirs: list[PathLike],
-	labels_include: tuple[str, ...],
-	labels_exclude: tuple[str, ...],
-	keep_epithelium: bool,
-	patient_id: int,
-) -> pd.DataFrame:
-	"""Read both pair data and trichromatic data for a given patient."""
-	patient_data_list = [
-		read_patient_data(
-			stat_dump_dir=p,
-			patient_id=patient_id,
-			labels_include=labels_include,
-			labels_exclude=labels_exclude,
-			keep_epithelium=keep_epithelium,
+	# Post-pivot column selectors to drop
+	# Drop non-domain diagrams for single cell types
+	single_cell_type = cs.matches(rf"^{dgm_names}\d+-{pers_stats_names}-[^/]+$")
+	non_dom_single_cell_type = single_cell_type - cs.matches(rf"dom\d+-{pers_stats_names}-.+$")
+	# Drop dom diagram for multiple cell types
+	dom_multiple_cell_types = cs.matches(rf"^dom\d+-{pers_stats_names}-[^/]+/.+$")
+	post_pivot_drop_cols = non_dom_single_cell_type | dom_multiple_cell_types
+
+	patient_dfs: list[pl.LazyFrame] = []
+	for path in stat_dump_dirs:
+		logging.getLogger().debug("Reading data for patient id %s from %s.", patient_id, path)
+		stat_path = Path(path).resolve()
+		df: pl.LazyFrame = (
+			pl.scan_parquet(
+				stat_path,
+				hive_partitioning=True,
+				missing_columns="insert",
+			)
+			.filter(pl.col("patient_id") == patient_id)
+			.drop("filtration_algorithm", "patient_id", pre_pivot_drop_cols)
+			.drop_nulls(subset="codomain")
+			.filter(filter_labels_include & filter_labels_exclude)
 		)
-		for p in stat_dump_dirs
-	]
-	return pd.concat(patient_data_list, axis=1)
+		patient_dfs.append(df)
+
+	# Output features are indexed by "<diagram><dim>-<statistic>_<variable>-<cell/group/types>"
+	return (
+		pl.concat(patient_dfs, how="vertical", rechunk=True)  # ruff: ignore[PD010]
+		.with_columns(pl.col("codomain").list.sort().list.join("/"))
+		.collect()
+		.pivot("codomain", index=["sample_type", "sample_id"], separator="-")
+		.drop(post_pivot_drop_cols)
+	)
 
 
 def classification_preprocess(
@@ -390,13 +394,13 @@ def run_classification_all_patients(
 	logger.info("Starting classification.")
 
 	classification_results_list = []
-	patient_ids = get_patient_ids(stats_dirs[0])
+	patient_ids = get_patient_ids(*stats_dirs)
 	for patient_id in tqdm(patient_ids, desc="Patients"):
 		logger.debug(
 			"Running classification for patient_id: %s",
 			patient_id,
 		)
-		data = read_patient_data_combined(
+		data = read_patient_data(
 			stat_dump_dirs=stats_dirs,
 			labels_include=labels_include,
 			labels_exclude=labels_exclude,
@@ -447,7 +451,7 @@ def run_classification_all_patients(
 				}
 				| result,
 			)
-	return pd.DataFrame.from_records(classification_results_list).set_index(
+	return pd.json_normalize(classification_results_list).set_index(
 		keys="patient_id",
 	)
 

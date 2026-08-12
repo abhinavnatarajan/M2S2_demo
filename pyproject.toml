@@ -25,6 +25,7 @@ dependencies = [
     "tables~=3.10",
     "ipykernel~=6.29.5",
     "ipympl~=0.9",
+    "polars>=1.43.2",
 ]
 
 [tool.setuptools]
