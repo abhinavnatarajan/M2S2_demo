@@ -6,40 +6,96 @@ import logging
 import math
 import os
 import pprint
+import re
 import time
-from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, ClassVar, Self, TypeGuard, cast, get_args
 
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import polars as pl
 import polars.selectors as cs
+import sklearn
+from chalc.sixpack.types import DiagramName
 from sklearn.base import BaseEstimator
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import brier_score_loss, make_scorer
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.validation import check_is_fitted
 from tqdm.auto import tqdm
 
 from utils.logging import configure_logger
 from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
 
-plt.style.use("seaborn-v0_8-darkgrid")
+sklearn.set_config(enable_metadata_routing=True)
 
 __all__ = [
 	"get_patient_ids",
 	"read_patient_data",
+	"run_classification_all_patients",
 	"run_classification_single_patient",
 ]
+
+SAMPLE_TYPES_ENUM = pl.Enum(["adenoma", "cancer"])
+
+
+@dataclass(slots=True)
+class FeatureParts:
+	"""Lazily parse a feature name into its components."""
+
+	dgm_and_dim: str
+	_dgm: DiagramName | None
+	_dim: int | None
+	statistic: str
+	codomain: str
+	NUM_FEATURE_NAME_PARTS: ClassVar[int] = 3
+	DGM_NAMES_REGEX: ClassVar[str] = "|".join(
+		re.escape(name) for name in get_args(DiagramName.__value__)
+	)
+
+	@classmethod
+	def is_diagram_name(cls, name: str) -> TypeGuard[DiagramName]:
+		"""Check if a string is a diagram name."""
+		return name in get_args(DiagramName.__value__)
+
+	def __init__(self, feature_name: str) -> None:
+		# Expects feature names of the form <dgm><dim>-<statistic>-<cell_type/cell_type/...>
+		# such as ker0-avg_birth-cell1/cell2/cell3
+		tokens = feature_name.split("-", maxsplit=2)
+		if len(tokens) != self.NUM_FEATURE_NAME_PARTS:
+			errmsg = f"Invalid feature name: {feature_name!r}"
+			raise ValueError(errmsg)
+		self.dgm_and_dim = tokens[0]
+		self._dgm = None
+		self._dim = None
+		self.statistic = tokens[1]
+		self.codomain = tokens[2]
+
+	def _parse_dgm_and_dim(self) -> None:
+		if self._dim is not None and self._dgm is not None:
+			return
+		match = re.fullmatch(rf"({self.DGM_NAMES_REGEX})(\d+)", self.dgm_and_dim)
+		if not match:
+			errmsg = f"Invalid diagram and dimension: {self.dgm_and_dim!r}"
+			raise ValueError(errmsg)
+		self._dgm = cast("DiagramName", match.group(1))
+		self._dim = int(match.group(2))
+
+	@property
+	def dim(self) -> int:
+		self._parse_dgm_and_dim()
+		return cast("int", self._dim)
+
+	@property
+	def dgm(self) -> DiagramName:
+		self._parse_dgm_and_dim()
+		return cast("DiagramName", self._dgm)
 
 
 class GroupwisePCA(BaseEstimator):
@@ -47,18 +103,29 @@ class GroupwisePCA(BaseEstimator):
 
 	def __init__(self) -> None:
 		"""Initialize the estimator."""
-		self.models = {}
 
-	def fit(self, data: pd.DataFrame) -> Self:
+	def fit(
+		self,
+		data: pl.DataFrame,
+		y: Any = None,  # noqa: ARG002
+		*,
+		cell_group_columns: dict[str, Sequence[str]] | None = None,
+	) -> Self:
 		"""Compute the PCA projection operators of each cell group from input data."""
-		cell_groups = sorted({column[-1] for column in data.columns})
+		if not cell_group_columns:
+			errmsg = "GroupwisePCA.fit requires non-empty cell_group_columns metadata."
+			raise ValueError(errmsg)
 
-		for cell_group in cell_groups:
-			columns = [column for column in data.columns if column[-1] == cell_group]
+		self.models_ = {}
 
+		for cell_group, group_columns in cell_group_columns.items():
+			columns = list(group_columns)
 			n_features = len(columns)
+			if n_features == 0:
+				errmsg = f"Cell group {cell_group!r} has no feature columns."
+				raise ValueError(errmsg)
 
-			# At most 5% of features, at least min(5, n_features) features
+			# Keep at least five components, or 5% for larger feature groups.
 			n_components = max(
 				math.ceil(0.05 * n_features),
 				min(n_features, 5),
@@ -83,9 +150,9 @@ class GroupwisePCA(BaseEstimator):
 				],
 			)
 
-			pipeline.fit(data.loc[:, columns])
+			pipeline.fit(data.select(columns))
 
-			self.models[cell_group] = {
+			self.models_[cell_group] = {
 				"columns": columns,
 				"pipeline": pipeline,
 				"n_components": n_components,
@@ -93,34 +160,38 @@ class GroupwisePCA(BaseEstimator):
 
 		return self
 
-	def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+	def transform(self, data: pl.DataFrame) -> pl.DataFrame:
 		"""Project each cell group in the input data onto the computed principal components."""
+		check_is_fitted(self, "models_")
 		transformed_groups = []
 
-		for cell_group, model_info in self.models.items():
+		for cell_group, model_info in self.models_.items():
 			columns = model_info["columns"]
 			pipeline = model_info["pipeline"]
 
-			values = pipeline.transform(data.loc[:, columns])
-
-			transformed_columns = pd.MultiIndex.from_tuples(
-				[(cell_group, f"pca_{component}") for component in range(values.shape[1])],
-				names=["cell_group", "component"],
-			)
+			values = pipeline.transform(data.select(columns))
+			new_column_names = [
+				f"pca_{component}-{cell_group}" for component in range(values.shape[1])
+			]
 
 			transformed_groups.append(
-				pd.DataFrame(
+				pl.DataFrame(
 					values,
-					index=data.index,
-					columns=transformed_columns,
+					schema=new_column_names,
 				),
 			)
 
-		return pd.concat(transformed_groups, axis=1)
+		return pl.concat(transformed_groups, how="horizontal").rechunk()
 
-	def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
+	def fit_transform(
+		self,
+		data: pl.DataFrame,
+		y: Any = None,
+		*,
+		cell_group_columns: dict[str, Sequence[str]] | None = None,
+	) -> pl.DataFrame:
 		"""Project each cell group in the input data onto the corresponding principal components."""
-		return self.fit(data).transform(data)
+		return self.fit(data, y, cell_group_columns=cell_group_columns).transform(data)
 
 
 def get_patient_ids(
@@ -157,9 +228,18 @@ def read_patient_data(
 		labels_exclude += ("Epithelium (imm)", "Epithelium (str)")
 
 	# Filters a row based on the codomain cell group
-	filter_labels_include = pl.col("codomain").list.set_difference(labels_include).list.len().eq(0)
-	filter_labels_exclude = (
-		pl.col("codomain").list.set_intersection(labels_exclude).list.len().eq(0)
+	codomain_in_labels_include = (
+		pl.col("codomain").list.set_difference(labels_include).list.len().eq(0)
+		if labels_include
+		else pl.lit(value=True)
+	)
+	codomain_not_in_labels_exclude = (
+		pl.col("codomain")
+		.list.set_intersection(
+			labels_exclude,
+		)
+		.list.len()
+		.eq(0)
 	)
 
 	# Some columns can be universally dropped without filtering the cell-groups.
@@ -201,51 +281,19 @@ def read_patient_data(
 			.filter(pl.col("patient_id") == patient_id)
 			.drop("filtration_algorithm", "patient_id", pre_pivot_drop_cols)
 			.drop_nulls(subset="codomain")
-			.filter(filter_labels_include & filter_labels_exclude)
+			.filter(codomain_in_labels_include & codomain_not_in_labels_exclude)
+			.cast({"sample_type": SAMPLE_TYPES_ENUM})
 		)
 		patient_dfs.append(df)
 
-	# Output features are indexed by "<diagram><dim>-<statistic>_<variable>-<cell/group/types>"
+	# Output features are named "<diagram><dim>-<statistic>_<variable>-<cell/group/types>".
 	return (
-		pl.concat(patient_dfs, how="vertical", rechunk=True)  # ruff: ignore[PD010]
+		pl.concat(patient_dfs, how="diagonal", rechunk=True)
 		.with_columns(pl.col("codomain").list.sort().list.join("/"))
 		.collect()
 		.pivot("codomain", index=["sample_type", "sample_id"], separator="-")
 		.drop(post_pivot_drop_cols)
 	)
-
-
-def classification_preprocess(
-	data: pd.DataFrame,
-) -> tuple[pd.DataFrame, float]:
-	"""Preprocess the data from a single patient for classification.
-
-	First epithelium data is dropped unless keep_epithelium is true.
-	Missing data is imputed by a constant value.
-	Then data is grouped by cell tuple, and PCA is run on each group,
-	keeping 10% of the features.
-	The data is replaced by the PCA projection.
-
-	"""
-	imputer = SimpleImputer(
-		strategy="constant",
-		fill_value=0,
-		keep_empty_features=True,
-	)
-
-	# Average percentage of features that are not NaN
-	avg_perc_features = np.mean(
-		data.agg(
-			lambda v: np.count_nonzero(~np.isnan(v)) / len(v),
-			axis="columns",
-		).to_numpy(),
-		dtype="float",
-	)
-
-	# Impute missing values
-	data = pd.DataFrame(imputer.fit_transform(data), columns=data.columns)
-
-	return data, avg_perc_features
 
 
 @dataclass(slots=True)
@@ -260,117 +308,210 @@ class ClassificationParams:
 	"""Number of cross-validation repetitions."""
 	num_permutations: int = field(kw_only=True)
 	"""Number of random permutations to use to estimate permutation importance scores."""
-	score_func: Callable[[np.ndarray, np.ndarray], float] = field(kw_only=True)
+	score_func: Callable[[Iterable, Iterable], float] = field(kw_only=True)
 	"""Score function to evaluate a prediction."""
 
 
-def run_classification_single_patient(
-	data: pd.DataFrame,
+def run_classification_single_patient(  # noqa: C901, PLR0915
+	data: pl.DataFrame,
 	*,
 	classification_params: ClassificationParams,
 ) -> dict[str, Any]:
-	"""Run classification for a single patient."""
-	# Check if the target has only samples of a given type
-	baseline_estimator = DummyClassifier()
+	"""Run classification for a single patient.
 
-	# Prediction target
-	y = data.index.get_level_values("sample_type").to_numpy()
+	For cross-validation: we repeat stratified K-fold cross-validation
+	several times, and record a single cross-validation score from each repetition.
+	The score from a single-repetition of cross-validation is computed
+	from concatenating the out-of-fold predictions from each fold, and
+	comparing with the ground truth via a loss function.
 
-	# If the target has only samples of a given type, return an empty dictionary
-	if len(np.unique(y)) == 1:
+	Feature importance for each cell-group is computed by a grouped permutation
+	importance score, averaged across several permutations per cell group.
+	In more detail: the importance score for a given cell-group is the drop in
+	prediction score of the estimators computed during cross-validation
+	(where the score is measured using the concatenated out-of-fold predictions)
+	when columns corresponding to the cell-group are permuted along their rows.
+	This score is averaged across several permutations per repetition of
+	cross-validation, and the distribution of feature importances across
+	repetitions is recorded for each cell group.
+	"""
+	# If data is empty return empty dictionary
+	if data.height == 0 or data.width == 0:
 		return {}
 
-	# Compute a baseline score
-	baseline = baseline_estimator.fit(data, y).score(data, y)
+	# Prediction target
+	y = data.get_column("sample_type").to_physical().to_numpy()
 
-	# Preprcess the data
-	data, avg_perc_features = classification_preprocess(data)
+	# If the target has only samples of a given type, return an empty dictionary
+	classes, class_counts = np.unique(y, return_counts=True)
+	if len(classes) == 1:
+		return {}
+	if len(classes) != len(SAMPLE_TYPES_ENUM.categories):
+		errmsg = (
+			f"Expected {len(SAMPLE_TYPES_ENUM.categories)} sample types, got {classes.tolist()}."
+		)
+		raise ValueError(errmsg)
+	if classification_params.cross_val_repeats < 1:
+		errmsg = "cross_val_repeats must be at least 1."
+		raise ValueError(errmsg)
+	if classification_params.num_permutations < 1:
+		errmsg = "num_permutations must be at least 1."
+		raise ValueError(errmsg)
+	n_splits = classification_params.splitter.get_n_splits(X=data, y=y)
+	if class_counts.min() < n_splits:
+		logging.getLogger(__name__).warning(
+			"Skipping patient: the smallest class has %d samples, fewer than %d CV folds.",
+			class_counts.min(),
+			n_splits,
+		)
+		return {}
 
-	cell_groups = np.unique([c[-1] for c in data.columns])
+	# Get the feature table only and pre-process it
+	data = data.drop("sample_type", "sample_id").rechunk()
+	if data.width == 0:
+		return {}
+	avg_perc_features = data.count().to_numpy().mean() / data.height
+	data = data.fill_null(strategy="zero")
 
-	# Train a classifier on the data and cross-validate
-	# Pre-compute the row permutations
-	rng = np.random.default_rng(0)
-	perms = np.array(
-		[rng.permutation(data.shape[0]) for j in range(classification_params.num_permutations)],
-	)
+	# Get a mapping of cell groups to column names
+	cell_groups = sorted({FeatureParts(colname).codomain for colname in data.columns})
+	cell_group_columns = {cell_group: [] for cell_group in cell_groups}
+	for column in data.columns:
+		cell_group = FeatureParts(column).codomain
+		cell_group_columns[cell_group].append(column)
+
+	# Pre-allocate the list of cross-validation scores and feature importances
 	cv_scores = np.empty(classification_params.cross_val_repeats, dtype=float)
-	group_importance_distributions = dict.fromkeys(
-		cell_groups,
-		np.empty(classification_params.cross_val_repeats, dtype=float),
-	)
+	baseline_scores = np.empty(classification_params.cross_val_repeats, dtype=float)
+	group_importance_distributions = {
+		cell_group: np.full(classification_params.cross_val_repeats, np.nan)
+		for cell_group in cell_groups
+	}
 
 	scorer = make_scorer(
 		classification_params.score_func,
-		greater_is_better=False,
+		greater_is_better=True,
 		response_method="predict_proba",
 	)
 
 	def compute_feature_importance_from_cv_result(
 		cv_score: float,
-		feature_group: str,
+		cell_group: str,
 	) -> tuple[str, float]:
 		score_from_random_permutations = 0
 		group_importance = 0
-		group_columns = [c for c in data.columns if c[-1] == feature_group]
+		group_columns = cell_group_columns[cell_group]
 
-		# Compute the classification score after permuting the rows of the data
-		# within the columns corresponding to this feature group
-		for perm in tqdm(perms, desc="Permutation", keep=False):
-			data_permuted = data.copy()
-			data_permuted.loc[:, group_columns] = data_permuted[group_columns].to_numpy()[perm]
-			oof_predictions = np.empty(len(y), dtype=float)
+		# Compute the classification score after jointly permuting this group's
+		# columns within each held-out fold.
+		for permutations_for_folds in fold_permutations:
+			oof_predictions = np.zeros(len(y), dtype=float)
 
-			for estimator, idx in zip(estimators, test_indices, strict=True):
-				data_test = data_permuted.iloc[idx]
-				# predict_proba gives a row of [Pr(0), Pr(1)] for each observation
-				oof_predictions[idx] = estimator.predict_proba(data_test)[:, 1]
+			for estimator, test_idxs, permutation in zip(
+				estimators,
+				test_indices_list,
+				permutations_for_folds,
+				strict=True,
+			):
+				data_test = data.gather(test_idxs)
+				data_test_permuted = data_test.update(
+					data_test.select(group_columns).gather(permutation),
+				)
+				oof_predictions[test_idxs] = predict_positive_probability(
+					estimator,
+					data_test_permuted,
+				)
 
-			score_from_random_permutations += classification_params.score_func(oof_predictions, y)
+			score_from_random_permutations += classification_params.score_func(y, oof_predictions)
 
-		# Group importance is the the average drop in score across permutations of the input
-		group_importance = cv_score - score_from_random_permutations / len(perms)
-		return feature_group, group_importance
+		# Group importance is the average drop in score across permutations of the input.
+		group_importance = (
+			cv_score - score_from_random_permutations / classification_params.num_permutations
+		)
+		return cell_group, group_importance
 
-	for rep in tqdm(
+	def predict_positive_probability(
+		estimator: BaseEstimator,
+		data_test: pl.DataFrame,
+	) -> np.ndarray:
+		classes_ = np.asarray(estimator.classes_)
+		positive_class_indices = np.flatnonzero(classes_ == classes.max())
+		if len(positive_class_indices) != 1:
+			errmsg = f"Could not identify the positive class in {classes_.tolist()}."
+			raise RuntimeError(errmsg)
+		return estimator.predict_proba(data_test)[:, positive_class_indices.item()]
+
+	for repetition in tqdm(
 		np.arange(classification_params.cross_val_repeats),
 		desc="Cross-validation repetition",
-		keep=False,
+		leave=False,
 	):
-		n_jobs = classification_params.splitter.get_n_splits(X=data, y=y)
+		splitter = StratifiedKFold(
+			n_splits=n_splits,
+			shuffle=True,
+			random_state=repetition,
+		)
 		cv_result = cross_validate(
 			classification_params.classifier,
 			data,
 			y,
 			scoring=scorer,
-			cv=classification_params.splitter,
-			n_jobs=n_jobs,
+			cv=splitter,
+			n_jobs=1,
 			return_estimator=True,
 			return_indices=True,
+			params={"cell_group_columns": cell_group_columns},
 		)
 		estimators = cv_result["estimator"]
-		test_indices = cv_result["indices"]["test"]
-		cv_scores[rep] = np.mean(cv_result["test_score"])
-		with ThreadPoolExecutor() as executor:
-			group_importances_futures = [
-				executor.submit(
-					compute_feature_importance_from_cv_result,
-					cv_scores[rep],
-					cell_group,
+		train_indices_list = cv_result["indices"]["train"]
+		test_indices_list = cv_result["indices"]["test"]
+		oof_predictions = np.empty(len(y), dtype=float)
+		baseline_oof_predictions = np.empty(len(y), dtype=float)
+		for estimator, train_idxs, test_idxs in zip(
+			estimators,
+			train_indices_list,
+			test_indices_list,
+			strict=True,
+		):
+			oof_predictions[test_idxs] = predict_positive_probability(
+				estimator,
+				data.gather(test_idxs),
+			)
+			baseline_estimator = DummyClassifier().fit(data.gather(train_idxs), y[train_idxs])
+			baseline_oof_predictions[test_idxs] = predict_positive_probability(
+				baseline_estimator,
+				data.gather(test_idxs),
+			)
+		cv_scores[repetition] = classification_params.score_func(y, oof_predictions)
+		baseline_scores[repetition] = classification_params.score_func(y, baseline_oof_predictions)
+		fold_permutations = [
+			[
+				np.random.default_rng(
+					(cast("int", repetition), permutation_index, fold_index),
+				).permutation(
+					len(test_idxs),
 				)
-				for cell_group in cell_groups
+				for fold_index, test_idxs in enumerate(test_indices_list)
 			]
-			for future in tqdm(
-				as_completed(group_importances_futures),
-				desc="Cell group",
-				total=len(cell_groups),
-				keep=False,
-			):
-				cell_group, cell_group_importance = future.result()
-				group_importance_distributions[cell_group][rep] = cell_group_importance
+			for permutation_index in range(classification_params.num_permutations)
+		]
+		# fold_permutations[i] is the ith permutation for this repetition
+		# The permutation is not generic, but only permutes within each fold.
+		# fold_permutations[i][j] is the permutation within fold j.
+
+		for cell_group in tqdm(
+			cell_groups,
+			desc="Cell group",
+			leave=False,
+		):
+			group_name, cell_group_importance = compute_feature_importance_from_cv_result(
+				cv_scores[repetition],
+				cell_group,
+			)
+			group_importance_distributions[group_name][repetition] = cell_group_importance
 
 	return {
-		"baseline": baseline,
+		"baseline": baseline_scores.mean(),
 		"scores": cv_scores,
 		"feature_importances": group_importance_distributions,
 		"num_samples": data.shape[0],
@@ -381,14 +522,14 @@ def run_classification_single_patient(
 def run_classification_all_patients(
 	*,
 	stats_dirs: list[PathLike],
-	labels_include: tuple[str, ...],
-	labels_exclude: tuple[str, ...],
-	keep_epithelium: bool,
-	cross_val_repeats: int,
-	cross_val_splits: int,
-	num_permutations: int,
-	num_workers: int,
-) -> pd.DataFrame:
+	labels_include: tuple[str, ...] = (),
+	labels_exclude: tuple[str, ...] = (),
+	keep_epithelium: bool = False,
+	cross_val_repeats: int = 50,
+	cross_val_splits: int = 8,
+	num_permutations: int = 30,
+	num_workers: int = 1,
+) -> list[dict]:
 	"""Run classification for each patient."""
 	logger = logging.getLogger(__name__)
 	logger.info("Starting classification.")
@@ -426,11 +567,17 @@ def run_classification_all_patients(
 			random_state=0,
 		)
 		classifier = Pipeline(
-			[("pca", GroupwisePCA()), ("classification", ensemble_classifier)],
+			[
+				(
+					"pca",
+					GroupwisePCA().set_fit_request(cell_group_columns=True),
+				),
+				("classification", ensemble_classifier),
+			],
 		)
-		splitter = StratifiedKFold(n_splits=cross_val_splits, random_state=0)
+		splitter = StratifiedKFold(n_splits=cross_val_splits)
 
-		def score_func(target: np.ndarray, pred: np.ndarray) -> float:
+		def score_func(target: Iterable, pred: Iterable) -> float:
 			return 1.0 - brier_score_loss(target, pred)
 
 		classification_params = ClassificationParams(
@@ -451,9 +598,7 @@ def run_classification_all_patients(
 				}
 				| result,
 			)
-	return pd.json_normalize(classification_results_list).set_index(
-		keys="patient_id",
-	)
+	return classification_results_list
 
 
 def _init_logging(args: argparse.Namespace) -> logging.Logger:
@@ -597,6 +742,7 @@ if __name__ == "__main__":
 	logger.debug("Provided arguments:\n%s", pprint.pformat(vars(args)))
 	labels_include = args.labels_include or ()
 	labels_exclude = args.labels_exclude or ()
+	Path(args.output_file).resolve().parent.mkdir(parents=True, exist_ok=True)
 	classification_results = run_classification_all_patients(
 		stats_dirs=args.stats_dirs,
 		labels_include=labels_include,
@@ -611,10 +757,9 @@ if __name__ == "__main__":
 		"Saving classification results to %s",
 		args.output_file,
 	)
-	Path(args.output_file).resolve().parent.mkdir(parents=True, exist_ok=True)
-	classification_results.to_hdf(
-		args.output_file,
-		key="classification_results_by_patient",
-		mode="w",
-		complevel=9,
-	)
+	# classification_results.to_hdf(
+	# 	args.output_file,
+	# 	key="classification_results_by_patient",
+	# 	mode="w",
+	# 	complevel=9,
+	# )

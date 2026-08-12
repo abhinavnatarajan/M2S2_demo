@@ -291,9 +291,8 @@ def get_pers_stats(
 			+ [len(barcode), entropy],
 			dtype=np.float64,
 		)
+		stats[~np.isfinite(stats)] = 0
 	else:
-		stats = np.array([np.nan] * (len(var_funcs) * len(statistic_funcs) + 2), dtype=np.float64)
-
-	stats[~np.isfinite(stats)] = 0
+		stats = np.array([0.0] * (len(var_funcs) * len(statistic_funcs) + 2), dtype=np.float64)
 
 	return stats
