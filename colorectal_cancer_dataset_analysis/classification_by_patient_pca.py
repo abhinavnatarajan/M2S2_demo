@@ -457,7 +457,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 			y,
 			scoring=scorer,
 			cv=splitter,
-			n_jobs=1,
+			n_jobs=n_splits,
 			return_estimator=True,
 			return_indices=True,
 			params={"cell_group_columns": cell_group_columns},
@@ -561,7 +561,7 @@ def run_classification_all_patients(
 		ensemble_classifier = BaggingClassifier(
 			gradient_booster,
 			n_estimators=500,
-			n_jobs=max(1, int(num_workers / 10)),
+			n_jobs=max(1, int(num_workers / cross_val_splits)),
 			max_samples=1.0,
 			bootstrap=False,
 			random_state=0,
