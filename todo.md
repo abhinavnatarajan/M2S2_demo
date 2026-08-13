@@ -1,17 +1,15 @@
 # Colorectal cancer
-- Repeated $K$-fold cross-validation
-    - Split the data into $K$ subsets.
+- One stratified $K$-fold cross-validation diagnostic
+    - Split the data into $K$ subsets using a fixed shuffled split.
     - Train $K$ models. Model $i$ is trained using all subsets except $i$, and tested on subset $i$.
-    - Using each observation's out-of-fold prediction, get a test accuracy (balanced accuracy, Brier loss, precision-recall AUC or ROC-AUC)
-    - Repeat these steps $r$ times, report the average and standard deviation of the $r$ test accuracy scores.
+    - Record the training and test score from every fold.
+    - Record one score from the concatenated out-of-fold predictions.
 - For grouped permutation importance:
-    - For each repetition $i$ and each fold $j$, permute the rows within each cell group in the test fold only, and compute the new set of test accuracy scores. Compute drop in the chosen accuracy score in the repetition $i$, associated with the permutation $k$.
-    - Perform the permutation step several times for each reptition $i$.
-    - Report average accuracy loss across all $i$ and $k$.
+    - Fit one final model on the complete patient dataset.
+    - Jointly permute the rows of all features within each cell group and score the fitted model without refitting it.
+    - Record the distribution of score decreases across permutations for every cell group.
 
-Recommended : 50 repetitions, 30 permutations with Brier loss.
-Report distribution of importance scores across repetitions, averaging the importance score within each repetition.
-Report distribution of accuracies across repetitions.
+Recommended: 30 permutations with Brier loss.
 
 # ABM
 - Zero imputation and standardization?

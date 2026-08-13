@@ -1,6 +1,8 @@
 #! /usr/bin/env python
 """Script to run classification per patient using trichromatic and pair stats reduced with PCA."""
 
+from __future__ import annotations
+
 import argparse
 import logging
 import math
@@ -8,27 +10,31 @@ import os
 import pprint
 import re
 import time
-from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import Any, ClassVar, Self, TypeGuard, cast, get_args
+from typing import TYPE_CHECKING, ClassVar, Self, TypeGuard, cast, get_args
 
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 import sklearn
 from chalc.sixpack.types import DiagramName
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
-from sklearn.metrics import brier_score_loss, make_scorer
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.metrics import brier_score_loss
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 from tqdm.auto import tqdm
+
+if TYPE_CHECKING:
+	from collections.abc import Callable, Sequence
+
+	from numpy.typing import ArrayLike
 
 from utils.logging import configure_logger
 from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
@@ -38,8 +44,8 @@ sklearn.set_config(enable_metadata_routing=True)
 __all__ = [
 	"get_patient_ids",
 	"read_patient_data",
+	"run_classification",
 	"run_classification_all_patients",
-	"run_classification_single_patient",
 ]
 
 SAMPLE_TYPES_ENUM = pl.Enum(["adenoma", "cancer"])
@@ -107,7 +113,7 @@ class GroupwisePCA(BaseEstimator):
 	def fit(
 		self,
 		data: pl.DataFrame,
-		y: Any = None,  # noqa: ARG002
+		_y: None = None,
 		*,
 		cell_group_columns: dict[str, Sequence[str]] | None = None,
 	) -> Self:
@@ -148,9 +154,7 @@ class GroupwisePCA(BaseEstimator):
 						PCA(n_components=n_components),
 					),
 				],
-			)
-
-			pipeline.fit(data.select(columns))
+			).fit(data.select(columns))
 
 			self.models_[cell_group] = {
 				"columns": columns,
@@ -186,7 +190,7 @@ class GroupwisePCA(BaseEstimator):
 	def fit_transform(
 		self,
 		data: pl.DataFrame,
-		y: Any = None,
+		y: None = None,
 		*,
 		cell_group_columns: dict[str, Sequence[str]] | None = None,
 	) -> pl.DataFrame:
@@ -303,37 +307,30 @@ class ClassificationParams:
 	classifier: BaseEstimator = field(kw_only=True)
 	"""Base model for classification."""
 	splitter: StratifiedKFold = field(kw_only=True)
-	"""Splitter for each cross-validation repetition."""
-	cross_val_repeats: int = field(kw_only=True)
-	"""Number of cross-validation repetitions."""
+	"""Splitter for the cross-validation diagnostic."""
 	num_permutations: int = field(kw_only=True)
 	"""Number of random permutations to use to estimate permutation importance scores."""
-	score_func: Callable[[Iterable, Iterable], float] = field(kw_only=True)
+	permutations_seed: int = field(kw_only=True)
+	"""Seed to generate the random permutations for feature importance testing."""
+	score_func: Callable[[ArrayLike, ArrayLike], float] = field(kw_only=True)
 	"""Score function to evaluate a prediction."""
 
 
-def run_classification_single_patient(  # noqa: C901, PLR0915
+def run_classification(  # noqa: C901, PLR0915
 	data: pl.DataFrame,
 	*,
 	classification_params: ClassificationParams,
-) -> dict[str, Any]:
+) -> dict:
 	"""Run classification for a single patient.
 
-	For cross-validation: we repeat stratified K-fold cross-validation
-	several times, and record a single cross-validation score from each repetition.
-	The score from a single-repetition of cross-validation is computed
-	from concatenating the out-of-fold predictions from each fold, and
-	comparing with the ground truth via a loss function.
+	One stratified K-fold cross-validation pass records the training and test score
+	for each fold, along with a score from the concatenated out-of-fold predictions.
 
-	Feature importance for each cell-group is computed by a grouped permutation
-	importance score, averaged across several permutations per cell group.
-	In more detail: the importance score for a given cell-group is the drop in
-	prediction score of the estimators computed during cross-validation
-	(where the score is measured using the concatenated out-of-fold predictions)
-	when columns corresponding to the cell-group are permuted along their rows.
-	This score is averaged across several permutations per repetition of
-	cross-validation, and the distribution of feature importances across
-	repetitions is recorded for each cell group.
+	A final model is then fitted on the complete patient dataset. Feature importance
+	for each cell group is the distribution of score decreases obtained by jointly
+	permuting that group's feature columns and predicting with the fitted final model.
+	These importances measure final-model reliance within the observed dataset; they
+	do not establish causal effects.
 	"""
 	# If data is empty return empty dictionary
 	if data.height == 0 or data.width == 0:
@@ -351,9 +348,8 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 			f"Expected {len(SAMPLE_TYPES_ENUM.categories)} sample types, got {classes.tolist()}."
 		)
 		raise ValueError(errmsg)
-	if classification_params.cross_val_repeats < 1:
-		errmsg = "cross_val_repeats must be at least 1."
-		raise ValueError(errmsg)
+
+	# Parameter validation
 	if classification_params.num_permutations < 1:
 		errmsg = "num_permutations must be at least 1."
 		raise ValueError(errmsg)
@@ -369,7 +365,8 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	# Get the feature table only and pre-process it
 	data = data.drop("sample_type", "sample_id").rechunk()
 	if data.width == 0:
-		return {}
+		errmsg = "Got a table with no feature columns."
+		raise ValueError(errmsg)
 	avg_perc_features = data.count().to_numpy().mean() / data.height
 	data = data.fill_null(strategy="zero")
 
@@ -380,143 +377,106 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 		cell_group = FeatureParts(column).codomain
 		cell_group_columns[cell_group].append(column)
 
-	# Pre-allocate the list of cross-validation scores and feature importances
-	cv_scores = np.empty(classification_params.cross_val_repeats, dtype=float)
-	baseline_scores = np.empty(classification_params.cross_val_repeats, dtype=float)
-	group_importance_distributions = {
-		cell_group: np.full(classification_params.cross_val_repeats, np.nan)
-		for cell_group in cell_groups
-	}
-
-	scorer = make_scorer(
-		classification_params.score_func,
-		greater_is_better=True,
-		response_method="predict_proba",
-	)
-
-	def compute_feature_importance_from_cv_result(
-		cv_score: float,
-		cell_group: str,
-	) -> tuple[str, float]:
-		score_from_random_permutations = 0
-		group_importance = 0
-		group_columns = cell_group_columns[cell_group]
-
-		# Compute the classification score after jointly permuting this group's
-		# columns within each held-out fold.
-		for permutations_for_folds in fold_permutations:
-			oof_predictions = np.zeros(len(y), dtype=float)
-
-			for estimator, test_idxs, permutation in zip(
-				estimators,
-				test_indices_list,
-				permutations_for_folds,
-				strict=True,
-			):
-				data_test = data.gather(test_idxs)
-				data_test_permuted = data_test.update(
-					data_test.select(group_columns).gather(permutation),
-				)
-				oof_predictions[test_idxs] = predict_positive_probability(
-					estimator,
-					data_test_permuted,
-				)
-
-			score_from_random_permutations += classification_params.score_func(y, oof_predictions)
-
-		# Group importance is the average drop in score across permutations of the input.
-		group_importance = (
-			cv_score - score_from_random_permutations / classification_params.num_permutations
-		)
-		return cell_group, group_importance
-
 	def predict_positive_probability(
 		estimator: BaseEstimator,
 		data_test: pl.DataFrame,
 	) -> np.ndarray:
-		classes_ = np.asarray(estimator.classes_)
+		classes_: np.ndarray[tuple[int], np.dtype[np.integer]] = np.asarray(estimator.classes_)
 		positive_class_indices = np.flatnonzero(classes_ == classes.max())
 		if len(positive_class_indices) != 1:
 			errmsg = f"Could not identify the positive class in {classes_.tolist()}."
 			raise RuntimeError(errmsg)
 		return estimator.predict_proba(data_test)[:, positive_class_indices.item()]
 
-	for repetition in tqdm(
-		np.arange(classification_params.cross_val_repeats),
-		desc="Cross-validation repetition",
+	# Run one cross-validation pass as an overfitting diagnostic.
+	cv_train_scores = np.empty(n_splits, dtype=float)
+	cv_test_scores = np.empty(n_splits, dtype=float)
+	cv_baseline_test_scores = np.empty(n_splits, dtype=float)
+	oof_predictions = np.empty(len(y), dtype=float)
+	oof_baseline_predictions = np.empty(len(y), dtype=float)
+	cv_splits = classification_params.splitter.split(data, y)
+	for fold_index, (train_idxs, test_idxs) in enumerate(
+		tqdm(
+			cv_splits,
+			desc="Cross-validation fold",
+			total=n_splits,
+			leave=False,
+		),
+	):
+		data_train = data.gather(train_idxs)
+		data_test = data.gather(test_idxs)
+		estimator = clone(classification_params.classifier)
+		estimator.fit(
+			data_train,
+			y[train_idxs],
+			cell_group_columns=cell_group_columns,
+		)
+		train_predictions = predict_positive_probability(estimator, data_train)
+		test_predictions = predict_positive_probability(estimator, data_test)
+		cv_train_scores[fold_index] = classification_params.score_func(
+			y[train_idxs],
+			train_predictions,
+		)
+		cv_test_scores[fold_index] = classification_params.score_func(
+			y[test_idxs],
+			test_predictions,
+		)
+		oof_predictions[test_idxs] = test_predictions
+
+		baseline_estimator = DummyClassifier().fit(data_train, y[train_idxs])
+		baseline_predictions = predict_positive_probability(baseline_estimator, data_test)
+		oof_baseline_predictions[test_idxs] = baseline_predictions
+		cv_baseline_test_scores[fold_index] = classification_params.score_func(
+			y[test_idxs],
+			baseline_predictions,
+		)
+	cv_oof_score = classification_params.score_func(y, oof_predictions)
+
+	# Fit one final model to all observations and evaluate grouped permutation importance.
+	final_model = clone(classification_params.classifier)
+	final_model.fit(data, y, cell_group_columns=cell_group_columns)
+	final_model_predictions = predict_positive_probability(final_model, data)
+	final_model_score = classification_params.score_func(y, final_model_predictions)
+	rng = np.random.default_rng(classification_params.permutations_seed)
+	permutations = [
+		rng.permutation(data.height) for _ in range(classification_params.num_permutations)
+	]
+	group_importance_distributions = {
+		cell_group: np.empty(classification_params.num_permutations, dtype=float)
+		for cell_group in cell_groups
+	}
+	for cell_group in tqdm(
+		cell_groups,
+		desc="Cell group",
 		leave=False,
 	):
-		splitter = StratifiedKFold(
-			n_splits=n_splits,
-			shuffle=True,
-			random_state=repetition,
-		)
-		cv_result = cross_validate(
-			classification_params.classifier,
-			data,
-			y,
-			scoring=scorer,
-			cv=splitter,
-			n_jobs=n_splits,
-			return_estimator=True,
-			return_indices=True,
-			params={"cell_group_columns": cell_group_columns},
-		)
-		estimators = cv_result["estimator"]
-		train_indices_list = cv_result["indices"]["train"]
-		test_indices_list = cv_result["indices"]["test"]
-		oof_predictions = np.empty(len(y), dtype=float)
-		baseline_oof_predictions = np.empty(len(y), dtype=float)
-		for estimator, train_idxs, test_idxs in zip(
-			estimators,
-			train_indices_list,
-			test_indices_list,
-			strict=True,
-		):
-			oof_predictions[test_idxs] = predict_positive_probability(
-				estimator,
-				data.gather(test_idxs),
+		group_columns = cell_group_columns[cell_group]
+		for permutation_index, permutation in enumerate(permutations):
+			data_permuted = data.update(
+				data.select(group_columns).gather(permutation),
 			)
-			baseline_estimator = DummyClassifier().fit(data.gather(train_idxs), y[train_idxs])
-			baseline_oof_predictions[test_idxs] = predict_positive_probability(
-				baseline_estimator,
-				data.gather(test_idxs),
+			permuted_predictions = predict_positive_probability(final_model, data_permuted)
+			permuted_score = classification_params.score_func(y, permuted_predictions)
+			group_importance_distributions[cell_group][permutation_index] = (
+				final_model_score - permuted_score
 			)
-		cv_scores[repetition] = classification_params.score_func(y, oof_predictions)
-		baseline_scores[repetition] = classification_params.score_func(y, baseline_oof_predictions)
-		fold_permutations = [
-			[
-				np.random.default_rng(
-					(cast("int", repetition), permutation_index, fold_index),
-				).permutation(
-					len(test_idxs),
-				)
-				for fold_index, test_idxs in enumerate(test_indices_list)
-			]
-			for permutation_index in range(classification_params.num_permutations)
-		]
-		# fold_permutations[i] is the ith permutation for this repetition
-		# The permutation is not generic, but only permutes within each fold.
-		# fold_permutations[i][j] is the permutation within fold j.
-
-		for cell_group in tqdm(
-			cell_groups,
-			desc="Cell group",
-			leave=False,
-		):
-			group_name, cell_group_importance = compute_feature_importance_from_cv_result(
-				cv_scores[repetition],
-				cell_group,
-			)
-			group_importance_distributions[group_name][repetition] = cell_group_importance
 
 	return {
-		"baseline": baseline_scores.mean(),
-		"scores": cv_scores,
+		"cv_train_scores": cv_train_scores,
+		"cv_test_scores": cv_test_scores,
+		"cv_oof_score": cv_oof_score,
+		"cv_baseline_test_scores": cv_baseline_test_scores,
+		"final_model_score": final_model_score,
 		"feature_importances": group_importance_distributions,
+		"num_cross_val_splits": n_splits,
+		"num_permutations": classification_params.num_permutations,
 		"num_samples": data.shape[0],
 		"avg_perc_features": avg_perc_features,
 	}
+
+
+def brier_score(target: ArrayLike, pred: ArrayLike) -> float:
+	return float(1.0 - brier_score_loss(target, pred))
 
 
 def run_classification_all_patients(
@@ -525,7 +485,6 @@ def run_classification_all_patients(
 	labels_include: tuple[str, ...] = (),
 	labels_exclude: tuple[str, ...] = (),
 	keep_epithelium: bool = False,
-	cross_val_repeats: int = 50,
 	cross_val_splits: int = 8,
 	num_permutations: int = 30,
 	num_workers: int = 1,
@@ -561,7 +520,7 @@ def run_classification_all_patients(
 		ensemble_classifier = BaggingClassifier(
 			gradient_booster,
 			n_estimators=500,
-			n_jobs=max(1, int(num_workers / cross_val_splits)),
+			n_jobs=max(1, num_workers),
 			max_samples=1.0,
 			bootstrap=False,
 			random_state=0,
@@ -575,19 +534,20 @@ def run_classification_all_patients(
 				("classification", ensemble_classifier),
 			],
 		)
-		splitter = StratifiedKFold(n_splits=cross_val_splits)
-
-		def score_func(target: Iterable, pred: Iterable) -> float:
-			return 1.0 - brier_score_loss(target, pred)
+		splitter = StratifiedKFold(
+			n_splits=cross_val_splits,
+			shuffle=True,
+			random_state=0,
+		)
 
 		classification_params = ClassificationParams(
 			classifier=classifier,
 			splitter=splitter,
-			cross_val_repeats=cross_val_repeats,
 			num_permutations=num_permutations,
-			score_func=score_func,
+			permutations_seed=0,
+			score_func=brier_score,
 		)
-		result = run_classification_single_patient(
+		result = run_classification(
 			data,
 			classification_params=classification_params,
 		)
@@ -693,24 +653,15 @@ if __name__ == "__main__":
 		"--cross-val-splits": {
 			"type": int,
 			"default": 8,
-			"help": "Number of folds in each repetition of cross-validation.",
-		},
-		"--cross-val-repeats": {
-			"type": int,
-			"default": 50,
-			"help": "Number of cross-validation repetitions.",
+			"help": "Number of folds in the stratified cross-validation diagnostic.",
 		},
 		"--num-permutations": {
 			"type": int,
 			"default": 30,
 			"help": "Number of permutations to use for computing "
 			"grouped permutation importance scores. "
-			"In each repetition of cross-validation, "
-			"each feature group is permuted this many times."
-			"An out-of-fold prediction, is obtained after each permutation "
-			"and prediction loss is averaged across permutations. "
-			"This yields a matrix of importance scores of shape "
-			"[feature_group, repetition_index].",
+			"Each feature group is jointly permuted this many times and evaluated "
+			"using a model fitted once on the complete patient dataset.",
 		},
 		"--num-workers": {
 			"default": 0,
@@ -733,7 +684,7 @@ if __name__ == "__main__":
 	}
 
 	for k, v in default_options.items():
-		parser.add_argument(k, **v)
+		_ = parser.add_argument(k, **v)
 	args = parser.parse_args()
 	if args.num_workers == 0:
 		cpu_count = os.cpu_count()
@@ -750,7 +701,6 @@ if __name__ == "__main__":
 		keep_epithelium=args.keep_epithelium,
 		num_workers=args.num_workers,
 		num_permutations=args.num_permutations,
-		cross_val_repeats=args.cross_val_repeats,
 		cross_val_splits=args.cross_val_splits,
 	)
 	logger.info(

@@ -9,27 +9,30 @@ description = "Multiscale Multi-species Spatial Signatures"
 license = "MIT"
 requires-python = ">=3.13"
 authors = [
-    { name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
+	{ name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
 ]
 dependencies = [
-    "chalc~=14.0.0",
-    "tqdm~=4.66",
-    "gudhi~=3.10",
-    "scikit-tda~=1.0",
-    "scikit-learn~=1.8",
-    "scipy~=1.14",
-    "jupyterlab~=4.2",
-    "ipywidgets~=8.1",
-    "shapely~=2.0",
-    "pyarrow~=20.0",
-    "tables~=3.10",
-    "ipykernel~=6.29.5",
-    "ipympl~=0.9",
-    "polars>=1.43.2",
+	"chalc~=14.0.0",
+	"tqdm~=4.66",
+	"gudhi~=3.10",
+	"scikit-tda~=1.0",
+	"scikit-learn~=1.8",
+	"scipy~=1.14",
+	"jupyterlab~=4.2",
+	"ipywidgets~=8.1",
+	"shapely~=2.0",
+	"pyarrow~=20.0",
+	"tables~=3.10",
+	"ipykernel~=6.29.5",
+	"ipympl~=0.9",
+	"polars~=1.43.2",
 ]
 
 [tool.setuptools]
 packages = ["utils", "colorectal_cancer_dataset_analysis"]
+
+[tool.pyright]
+typeCheckingMode = "standard"
 
 [tool.ruff]
 line-length = 100
