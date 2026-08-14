@@ -278,7 +278,9 @@ def read_patient_data(
 	patient_dfs: list[pl.LazyFrame] = []
 	for path in stat_dump_dirs:
 		logging.getLogger(__name__).debug(
-			"Reading data for patient id %s from %s.", patient_id, path,
+			"Reading data for patient id %s from %s.",
+			patient_id,
+			path,
 		)
 		stat_path = Path(path).resolve()
 		df: pl.LazyFrame = (
@@ -456,7 +458,11 @@ def run_classification(  # noqa: C901, PLR0915
 		leave=False,
 	):
 		group_columns = cell_group_columns[cell_group]
-		for permutation_index, permutation in enumerate(permutations):
+		for permutation_index, permutation in tqdm(
+			enumerate(permutations),
+			desc="Permutation",
+			leave=False,
+		):
 			data_permuted = data.update(
 				data.select(group_columns).gather(permutation),
 			)
@@ -489,10 +495,7 @@ def save_classification_results(
 	output_dir: PathLike,
 ) -> None:
 	"""Collate per-patient classification results and write them to HDF5 tables."""
-	logging.getLogger(__name__).info(
-		"Saving classification results to %s",
-		output_dir
-	)
+	logging.getLogger(__name__).info("Saving classification results to %s", output_dir)
 	output_path = Path(output_dir).resolve()
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	result_table = pl.from_dicts(classification_results)
@@ -515,10 +518,9 @@ def run_classification_all_patients(
 	num_workers: int = 1,
 ) -> list[dict]:
 	"""Run classification for each patient."""
-	logging.getLogger(__name__).info("Starting classification.")
-
 	classification_results_list = []
 	patient_ids = get_patient_ids(*stats_dirs)
+	logging.getLogger(__name__).info("Starting classification.")
 	for patient_id in tqdm(patient_ids, desc="Patients"):
 		logger.debug(
 			"Running classification for patient_id: %s",
