@@ -491,7 +491,7 @@ def save_classification_results(
 	"""Collate per-patient classification results and write them to HDF5 tables."""
 	logging.getLogger(__name__).info(
 		"Saving classification results to %s",
-		args.output_file,
+		output_dir
 	)
 	output_path = Path(output_dir).resolve()
 	output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -717,7 +717,7 @@ if __name__ == "__main__":
 	logger.debug("Provided arguments:\n%s", pprint.pformat(vars(args)))
 	labels_include = args.labels_include or ()
 	labels_exclude = args.labels_exclude or ()
-	Path(args.output_file).resolve().parent.mkdir(parents=True, exist_ok=True)
+	Path(args.output_dir).resolve().mkdir(parents=True, exist_ok=True)
 	classification_results = run_classification_all_patients(
 		stats_dirs=args.stats_dirs,
 		labels_include=labels_include,
