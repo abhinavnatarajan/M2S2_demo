@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Self, TypeGuard, cast, get_args
 
 import numpy as np
+
+# import pandas as pd
 import polars as pl
 import polars.selectors as cs
 import sklearn
@@ -46,6 +48,7 @@ __all__ = [
 	"read_patient_data",
 	"run_classification",
 	"run_classification_all_patients",
+	"save_classification_results",
 ]
 
 SAMPLE_TYPES_ENUM = pl.Enum(["adenoma", "cancer"])
@@ -274,7 +277,9 @@ def read_patient_data(
 
 	patient_dfs: list[pl.LazyFrame] = []
 	for path in stat_dump_dirs:
-		logging.getLogger().debug("Reading data for patient id %s from %s.", patient_id, path)
+		logging.getLogger(__name__).debug(
+			"Reading data for patient id %s from %s.", patient_id, path,
+		)
 		stat_path = Path(path).resolve()
 		df: pl.LazyFrame = (
 			pl.scan_parquet(
@@ -479,6 +484,26 @@ def brier_score(target: ArrayLike, pred: ArrayLike) -> float:
 	return float(1.0 - brier_score_loss(target, pred))
 
 
+def save_classification_results(
+	classification_results: Sequence[dict],
+	output_dir: PathLike,
+) -> None:
+	"""Collate per-patient classification results and write them to HDF5 tables."""
+	logging.getLogger(__name__).info(
+		"Saving classification results to %s",
+		args.output_file,
+	)
+	output_path = Path(output_dir).resolve()
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	result_table = pl.from_dicts(classification_results)
+	result_table.write_parquet(
+		output_path,
+		compression="zstd",
+		compression_level=9,
+		partition_by="patient_id",
+	)
+
+
 def run_classification_all_patients(
 	*,
 	stats_dirs: list[PathLike],
@@ -490,8 +515,7 @@ def run_classification_all_patients(
 	num_workers: int = 1,
 ) -> list[dict]:
 	"""Run classification for each patient."""
-	logger = logging.getLogger(__name__)
-	logger.info("Starting classification.")
+	logging.getLogger(__name__).info("Starting classification.")
 
 	classification_results_list = []
 	patient_ids = get_patient_ids(*stats_dirs)
@@ -603,10 +627,10 @@ if __name__ == "__main__":
 			"default": [str(base_path.joinpath("stats"))],
 			"help": "List of absolute or relative paths to the cell-group statistics.",
 		},
-		"--output-file": {
+		"--output-dir": {
 			"type": str,
-			"default": str(base_path.joinpath("results", "classification_results.h5")),
-			"help": "Absolute or relative path to the output file to save.",
+			"default": str(base_path.joinpath("results", "classification_results")),
+			"help": "Absolute or relative path to the output directory to save.",
 		},
 		"--labels-include": {
 			"type": str,
@@ -703,13 +727,4 @@ if __name__ == "__main__":
 		num_permutations=args.num_permutations,
 		cross_val_splits=args.cross_val_splits,
 	)
-	logger.info(
-		"Saving classification results to %s",
-		args.output_file,
-	)
-	# classification_results.to_hdf(
-	# 	args.output_file,
-	# 	key="classification_results_by_patient",
-	# 	mode="w",
-	# 	complevel=9,
-	# )
+	save_classification_results(classification_results, args.output_dir)
