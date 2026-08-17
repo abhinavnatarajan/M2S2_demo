@@ -7,7 +7,7 @@ name = "M2S2_demo"
 version = "0.1.0"
 description = "Multiscale Multi-species Spatial Signatures"
 license = "MIT"
-requires-python = ">=3.13"
+requires-python = "~=3.13.0"
 authors = [
 	{ name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
 ]
@@ -21,11 +21,11 @@ dependencies = [
 	"jupyterlab~=4.2",
 	"ipywidgets~=8.1",
 	"shapely~=2.0",
-	"pyarrow~=20.0",
 	"tables~=3.10",
 	"ipykernel~=6.29.5",
 	"ipympl~=0.9",
 	"polars~=1.43.2",
+	"pyarrow~=25.0.1",
 ]
 
 [tool.setuptools]

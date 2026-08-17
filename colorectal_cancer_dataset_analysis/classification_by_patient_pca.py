@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import os
 import pprint
 import re
@@ -13,24 +12,21 @@ import time
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Self, TypeGuard, cast, get_args
+from typing import TYPE_CHECKING, ClassVar, TypeGuard, cast, get_args
 
 import numpy as np
-
-# import pandas as pd
 import polars as pl
 import polars.selectors as cs
+import pyarrow as pa
+import pyarrow.parquet as pq
 import sklearn
 from chalc.sixpack.types import DiagramName
 from sklearn.base import BaseEstimator, clone
-from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_is_fitted
 from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
@@ -39,6 +35,7 @@ if TYPE_CHECKING:
 	from numpy.typing import ArrayLike
 
 from utils.logging import configure_logger
+from utils.pca import GroupwisePCA
 from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
 
 sklearn.set_config(enable_metadata_routing=True)
@@ -46,8 +43,8 @@ sklearn.set_config(enable_metadata_routing=True)
 __all__ = [
 	"get_patient_ids",
 	"read_patient_data",
-	"run_classification",
 	"run_classification_all_patients",
+	"run_classification_single_patient",
 	"save_classification_results",
 ]
 
@@ -105,100 +102,6 @@ class FeatureParts:
 	def dgm(self) -> DiagramName:
 		self._parse_dgm_and_dim()
 		return cast("DiagramName", self._dgm)
-
-
-class GroupwisePCA(BaseEstimator):
-	"""Run PCA on the features from each cell group separately."""
-
-	def __init__(self) -> None:
-		"""Initialize the estimator."""
-
-	def fit(
-		self,
-		data: pl.DataFrame,
-		_y: None = None,
-		*,
-		cell_group_columns: dict[str, Sequence[str]] | None = None,
-	) -> Self:
-		"""Compute the PCA projection operators of each cell group from input data."""
-		if not cell_group_columns:
-			errmsg = "GroupwisePCA.fit requires non-empty cell_group_columns metadata."
-			raise ValueError(errmsg)
-
-		self.models_ = {}
-
-		for cell_group, group_columns in cell_group_columns.items():
-			columns = list(group_columns)
-			n_features = len(columns)
-			if n_features == 0:
-				errmsg = f"Cell group {cell_group!r} has no feature columns."
-				raise ValueError(errmsg)
-
-			# Keep at least five components, or 5% for larger feature groups.
-			n_components = max(
-				math.ceil(0.05 * n_features),
-				min(n_features, 5),
-			)
-			# Respect the training-sample rank.
-			n_components = min(
-				n_components,
-				n_features,
-				max(1, len(data) - 1),
-			)
-
-			pipeline = Pipeline(
-				[
-					(
-						"standardization",
-						StandardScaler(),
-					),
-					(
-						"pca",
-						PCA(n_components=n_components),
-					),
-				],
-			).fit(data.select(columns))
-
-			self.models_[cell_group] = {
-				"columns": columns,
-				"pipeline": pipeline,
-				"n_components": n_components,
-			}
-
-		return self
-
-	def transform(self, data: pl.DataFrame) -> pl.DataFrame:
-		"""Project each cell group in the input data onto the computed principal components."""
-		check_is_fitted(self, "models_")
-		transformed_groups = []
-
-		for cell_group, model_info in self.models_.items():
-			columns = model_info["columns"]
-			pipeline = model_info["pipeline"]
-
-			values = pipeline.transform(data.select(columns))
-			new_column_names = [
-				f"pca_{component}-{cell_group}" for component in range(values.shape[1])
-			]
-
-			transformed_groups.append(
-				pl.DataFrame(
-					values,
-					schema=new_column_names,
-				),
-			)
-
-		return pl.concat(transformed_groups, how="horizontal").rechunk()
-
-	def fit_transform(
-		self,
-		data: pl.DataFrame,
-		y: None = None,
-		*,
-		cell_group_columns: dict[str, Sequence[str]] | None = None,
-	) -> pl.DataFrame:
-		"""Project each cell group in the input data onto the corresponding principal components."""
-		return self.fit(data, y, cell_group_columns=cell_group_columns).transform(data)
 
 
 def get_patient_ids(
@@ -323,7 +226,7 @@ class ClassificationParams:
 	"""Score function to evaluate a prediction."""
 
 
-def run_classification(  # noqa: C901, PLR0915
+def run_classification_single_patient(  # noqa: C901, PLR0915
 	data: pl.DataFrame,
 	*,
 	classification_params: ClassificationParams,
@@ -416,7 +319,7 @@ def run_classification(  # noqa: C901, PLR0915
 		estimator.fit(
 			data_train,
 			y[train_idxs],
-			cell_group_columns=cell_group_columns,
+			columns_by_group=cell_group_columns,
 		)
 		train_predictions = predict_positive_probability(estimator, data_train)
 		test_predictions = predict_positive_probability(estimator, data_test)
@@ -441,7 +344,7 @@ def run_classification(  # noqa: C901, PLR0915
 
 	# Fit one final model to all observations and evaluate grouped permutation importance.
 	final_model = clone(classification_params.classifier)
-	final_model.fit(data, y, cell_group_columns=cell_group_columns)
+	final_model.fit(data, y, columns_by_group=cell_group_columns)
 	final_model_predictions = predict_positive_probability(final_model, data)
 	final_model_score = classification_params.score_func(y, final_model_predictions)
 	rng = np.random.default_rng(classification_params.permutations_seed)
@@ -494,34 +397,67 @@ def save_classification_results(
 	classification_results: Sequence[dict],
 	output_dir: PathLike,
 ) -> None:
-	"""Collate per-patient classification results and write them to HDF5 tables."""
+	"""Write classification results to parquet files."""
 	logging.getLogger(__name__).info("Saving classification results to %s", output_dir)
 	output_path = Path(output_dir).resolve()
 	output_path.parent.mkdir(parents=True, exist_ok=True)
-	result_table = pl.from_dicts(classification_results)
-	result_table.write_parquet(
-		output_path,
+	result_table: pa.Table = pl.from_dicts(classification_results).to_arrow()
+	pq.write_to_dataset(
+		result_table,
+		root_path=str(output_path),
+		partition_cols=["patient_id"],
 		compression="zstd",
 		compression_level=9,
-		partition_by="patient_id",
+		existing_data_behavior="delete_matching",
 	)
+
+
+def results_already_exist(patient_id: int, output_dir: PathLike) -> bool:
+	output_path = Path(output_dir).resolve()
+	if not output_path.is_dir():
+		return False
+	try:
+		return not (
+			pl.scan_parquet(
+				output_path,
+				hive_partitioning=True,
+				missing_columns="insert",
+			)
+			.filter(pl.col("patient_id") == patient_id)
+			.limit(1)
+			.collect()
+			.is_empty()
+		)
+	except pl.exceptions.PolarsError:
+		return False
 
 
 def run_classification_all_patients(
 	*,
 	stats_dirs: list[PathLike],
-	labels_include: tuple[str, ...] = (),
-	labels_exclude: tuple[str, ...] = (),
-	keep_epithelium: bool = False,
-	cross_val_splits: int = 8,
-	num_permutations: int = 30,
-	num_workers: int = 1,
-) -> list[dict]:
+	output_dir: PathLike,
+	labels_include: tuple[str, ...],
+	labels_exclude: tuple[str, ...],
+	keep_epithelium: bool,
+	cross_val_splits: int,
+	num_permutations: int,
+	num_workers: int,
+	resume: bool,
+) -> None:
 	"""Run classification for each patient."""
-	classification_results_list = []
+	logger = logging.getLogger(__name__)
+	logger.info("Starting classification.")
+
 	patient_ids = get_patient_ids(*stats_dirs)
-	logging.getLogger(__name__).info("Starting classification.")
+
 	for patient_id in tqdm(patient_ids, desc="Patients"):
+		if resume and results_already_exist(patient_id.item(), output_dir):
+			logger.debug(
+				"Skipping classification for patient_id: %s",
+				patient_id,
+			)
+			continue
+
 		logger.debug(
 			"Running classification for patient_id: %s",
 			patient_id,
@@ -555,7 +491,7 @@ def run_classification_all_patients(
 			[
 				(
 					"pca",
-					GroupwisePCA().set_fit_request(cell_group_columns=True),
+					GroupwisePCA().set_fit_request(columns_by_group=True),
 				),
 				("classification", ensemble_classifier),
 			],
@@ -573,18 +509,19 @@ def run_classification_all_patients(
 			permutations_seed=0,
 			score_func=brier_score,
 		)
-		result = run_classification(
-			data,
-			classification_params=classification_params,
-		)
-		if len(result) > 0:
-			classification_results_list.append(
-				{
-					"patient_id": patient_id.item(),
-				}
-				| result,
+		result = None
+		try:
+			result = run_classification_single_patient(
+				data,
+				classification_params=classification_params,
 			)
-	return classification_results_list
+		except Exception:
+			errmsg = f"Encountered error during classification for patient {patient_id.item()}."
+			logger.exception(errmsg)
+
+		if isinstance(result, dict) and len(result) > 0:
+			result = {"patient_id": patient_id.item()} | result
+			save_classification_results([result], output_dir)
 
 
 def _init_logging(args: argparse.Namespace) -> logging.Logger:
@@ -684,28 +621,40 @@ if __name__ == "__main__":
 		"--num-permutations": {
 			"type": int,
 			"default": 30,
-			"help": "Number of permutations to use for computing "
-			"grouped permutation importance scores. "
-			"Each feature group is jointly permuted this many times and evaluated "
-			"using a model fitted once on the complete patient dataset.",
+			"help": (
+				"Number of permutations to use for computing "
+				"grouped permutation importance scores. "
+				"Each feature group is jointly permuted this many times and evaluated "
+				"using a model fitted once on the complete patient dataset."
+			),
 		},
 		"--num-workers": {
 			"default": 0,
 			"type": int,
-			"help": "Number of CPUs to use for parallel processing. "
-			"Set to 0 to use all available CPUs.",
+			"help": (
+				"Number of CPUs to use for parallel processing. Set to 0 to use all available CPUs."
+			),
 		},
 		"--logfile-dir": {
 			"default": str(base_path.joinpath("logs")),
 			"type": str,
 			"help": "Directory where log files will be saved.",
 		},
+		"--resume": {
+			"action": argparse.BooleanOptionalAction,
+			"help": (
+				"If --resume is set, don't recompute classification results from previous runs."
+			),
+			"default": True,
+		},
 		"--verbosity": {
 			"default": "INFO",
 			"type": str,
 			"choices": ("DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"),
-			"help": "Set the verbosity level of the logger. "
-			"Only messages of this level and higher will be logged.",
+			"help": (
+				"Set the verbosity level of the logger. "
+				"Only messages of this level and higher will be logged."
+			),
 		},
 	}
 
@@ -728,5 +677,6 @@ if __name__ == "__main__":
 		num_workers=args.num_workers,
 		num_permutations=args.num_permutations,
 		cross_val_splits=args.cross_val_splits,
+		output_dir=args.output_dir,
+		resume=args.resume,
 	)
-	save_classification_results(classification_results, args.output_dir)
