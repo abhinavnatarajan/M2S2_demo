@@ -281,10 +281,13 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	data = data.fill_null(strategy="zero")
 
 	# Get a mapping of cell groups to column names
-	cell_groups = sorted({FeatureParts(colname).codomain for colname in data.columns})
+	parsed_column_names = [FeatureParts(colname) for colname in data.columns]
+	cell_groups = sorted(
+		{parsed_column_name.codomain for parsed_column_name in parsed_column_names},
+	)
 	cell_group_columns = {cell_group: [] for cell_group in cell_groups}
-	for column in data.columns:
-		cell_group = FeatureParts(column).codomain
+	for column, parsed_column_name in zip(data.columns, parsed_column_names, strict=True):
+		cell_group = parsed_column_name.codomain
 		cell_group_columns[cell_group].append(column)
 
 	def predict_positive_probability(
