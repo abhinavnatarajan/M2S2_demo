@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Self, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Self, cast, overload
 
 import numpy as np
 import polars as pl
@@ -41,11 +42,7 @@ class CustomPCA(BaseEstimator):
 		self.centre = centre
 		self.lapack_driver = lapack_driver
 
-	def fit(self, data: ArrayLike, _y: ArrayLike | None = None) -> Self:
-		"""Compute the principal components from a data matrix.
-
-		It is assumed that columns of the input are features and rows are samples.
-		"""
+	def _validate_params(self) -> None:
 		if (
 			isinstance(self.max_components, (bool, np.bool_))
 			or not isinstance(self.max_components, (int, np.integer))
@@ -58,8 +55,21 @@ class CustomPCA(BaseEstimator):
 			errmsg = f"Invalid lapack_driver: {self.lapack_driver} not in ('gesdd', 'gesvd')."
 			raise ValueError(errmsg)
 
-		data_array = validate_data(self, X=data, reset=True, dtype="numeric")  # pyright:ignore[reportArgumentType]
-		data_array = cast("np.ndarray", data_array)
+	def _fit_svd(
+		self,
+		data: ArrayLike,
+	) -> tuple[np.ndarray, np.ndarray]:
+		self._validate_params()
+		data_array = cast(
+			"np.ndarray",
+			validate_data(
+				self,
+				X=data,  # pyright: ignore[reportArgumentType]
+				reset=True,
+				dtype="numeric",
+			),
+		)
+
 		if self.centre:
 			self.data_mean_ = np.mean(data_array, axis=0)
 		else:
@@ -73,7 +83,14 @@ class CustomPCA(BaseEstimator):
 		# Then W D W^t = V S U^t U S V^t = V S^2 V^t, so in fact W = V and D = S^2.
 		# To project arbitrary data Z onto these principal components,
 		# we compute (V^t Z^t)^t = Z V. So we need to store V.
-		(_, _, vh) = svd(
+		# Return u and s so that that
+		# fit_transform()
+		# can directly use them.
+		# If we want the projection of the
+		# training data onto its principal components, then we can
+		# avoid an extra matrix multiplication associated with
+		# fit().transform(). We simply want X V = U S V^t V = U S.
+		(u, s, vh) = svd(
 			data_centred,
 			lapack_driver=self.lapack_driver,
 			full_matrices=False,
@@ -82,30 +99,97 @@ class CustomPCA(BaseEstimator):
 		)
 		self.components_ = vh[: self.max_components, :]
 		self.n_components_ = self.components_.shape[0]
+		return u, s
+
+	def fit(self, data: ArrayLike, _y: ArrayLike | None = None) -> Self:
+		"""Compute the principal components from a data matrix.
+
+		It is assumed that columns of the input are features and rows are samples.
+		"""
+		self._fit_svd(data)
 		return self
 
 	def transform(self, data: ArrayLike, _y: ArrayLike | None = None) -> ArrayLike:
 		"""Project data points onto the fitted principal components."""
 		check_is_fitted(self, ("components_", "n_components_", "data_mean_"))
-		data_array = validate_data(self, data, reset=False, dtype="numeric")  # pyright:ignore[reportArgumentType]
-		data_array = cast("np.ndarray", data_array)
+		data_array = cast(
+			"np.ndarray",
+			validate_data(
+				self,
+				data,  # pyright:ignore[reportArgumentType]
+				reset=False,
+				dtype="numeric",
+			),
+		)
 		return (data_array - self.data_mean_) @ self.components_.T
+
+	def fit_transform(self, data: ArrayLike, _y: ArrayLike | None = None) -> ArrayLike:
+		"""Find the principal components and project data onto them."""
+		u, s = self._fit_svd(data)
+		return u[:, : self.n_components_] * s[: self.n_components_]
 
 
 class GroupwisePCA(BaseEstimator):
 	"""Run PCA on the features from each group separately."""
 
+	n_features_in_: int
+	"""Number of features passed in during fitting."""
+	feature_names_in_: Sequence[str]
+	"""Names of input features seen during fitting."""
+	feature_names_out_: Sequence[str]
+	"""Names of output features after PCA."""
+	models_: dict[str, GroupModel]
+	"""Mapping of group names to pipeline and metadata."""
+
+	@dataclass(slots=True)
+	class GroupModel:
+		"""Pipeline and metadata for a single group of features."""
+
+		columns: Sequence[str]
+		"""Columns of the input associated to this feature."""
+		pipeline: Pipeline
+		"""Pipeline to process this group with."""
+		n_components: int
+		"""Number of fitted PCA components for this group."""
+		output_names: Sequence[str]
+		"""Output features names for this group."""
+
 	def __init__(self) -> None:
 		"""Initialize the estimator."""
 
-	def fit(
+	@overload
+	def _fit_groups(
 		self,
 		data: pl.DataFrame,
-		_y: ArrayLike | None = None,
 		*,
-		columns_by_group: dict[str, Sequence[str]] | None = None,
-	) -> Self:
-		"""Compute the PCA projection operators of each group from input data."""
+		columns_by_group: dict[str, Sequence[str]] | None,
+		return_transformed: Literal[True],
+	) -> list[pl.DataFrame]: ...
+	@overload
+	def _fit_groups(
+		self,
+		data: pl.DataFrame,
+		*,
+		columns_by_group: dict[str, Sequence[str]] | None,
+		return_transformed: Literal[False],
+	) -> None: ...
+	@overload
+	def _fit_groups(
+		self,
+		data: pl.DataFrame,
+		*,
+		columns_by_group: dict[str, Sequence[str]] | None,
+		return_transformed: bool,
+	) -> list[pl.DataFrame] | None: ...
+
+	def _fit_groups(
+		self,
+		data: pl.DataFrame,
+		*,
+		columns_by_group: dict[str, Sequence[str]] | None,
+		return_transformed: bool,
+	) -> list[pl.DataFrame] | None:
+		"""Inner helper for fit and transform methods."""
 		if not columns_by_group:
 			errmsg = "GroupwisePCA.fit requires non-empty columns_by_group metadata."
 			raise ValueError(errmsg)
@@ -117,8 +201,12 @@ class GroupwisePCA(BaseEstimator):
 			skip_check_array=True,
 		)
 		self.models_ = {}
+		self.feature_names_out_ = []
+
+		results = []
+
 		for group, group_columns in columns_by_group.items():
-			columns = list(group_columns)
+			columns = tuple(group_columns)
 			n_features = len(columns)
 			if n_features == 0:
 				errmsg = f"Group {group!r} has no feature columns."
@@ -145,14 +233,50 @@ class GroupwisePCA(BaseEstimator):
 						),
 					),
 				],
-			).fit(data.select(columns))
+			)
 
-			self.models_[group] = {
-				"columns": columns,
-				"pipeline": pipeline,
-				"n_components": pipeline.named_steps["pca"].n_components_,
-			}
+			group_data = data.select(columns).rechunk()
+			group_result_array = None
 
+			if return_transformed:
+				group_result_array = pipeline.fit_transform(group_data)
+			else:
+				pipeline.fit(group_data)
+
+			n_components: int = pipeline.named_steps["pca"].n_components_
+			group_output_columns = tuple(
+				f"pca_{component}-{group}" for component in range(n_components)
+			)
+
+			if return_transformed:
+				results.append(pl.DataFrame(group_result_array, schema=group_output_columns))
+
+			self.models_[group] = self.GroupModel(
+				columns=columns,
+				pipeline=pipeline,
+				n_components=n_components,
+				output_names=group_output_columns,
+			)
+			self.feature_names_out_ += group_output_columns
+
+		if return_transformed:
+			return results
+
+		return None
+
+	def fit(
+		self,
+		data: pl.DataFrame,
+		_y: ArrayLike | None = None,
+		*,
+		columns_by_group: dict[str, Sequence[str]] | None = None,
+	) -> Self:
+		"""Compute the PCA projection operators of each group from input data."""
+		self._fit_groups(
+			data,
+			columns_by_group=columns_by_group,
+			return_transformed=False,
+		)
 		return self
 
 	def transform(self, data: pl.DataFrame) -> pl.DataFrame:
@@ -166,21 +290,17 @@ class GroupwisePCA(BaseEstimator):
 		)
 		transformed_groups = []
 
-		output_names = self.get_feature_names_out()
-		name_offset = 0
 		for model_info in self.models_.values():
-			columns = model_info["columns"]
-			pipeline = model_info["pipeline"]
-			n_components = model_info["n_components"]
+			columns = model_info.columns
+			pipeline = model_info.pipeline
+			output_names = model_info.output_names
 
 			values = pipeline.transform(data.select(columns))
-			new_column_names = output_names[name_offset : name_offset + n_components].tolist()
-			name_offset += n_components
 
 			transformed_groups.append(
 				pl.DataFrame(
 					values,
-					schema=new_column_names,
+					schema=output_names,
 				),
 			)
 
@@ -189,46 +309,26 @@ class GroupwisePCA(BaseEstimator):
 	def fit_transform(
 		self,
 		data: pl.DataFrame,
-		y: ArrayLike | None = None,
+		_y: ArrayLike | None = None,
 		*,
 		columns_by_group: dict[str, Sequence[str]] | None = None,
 	) -> pl.DataFrame:
 		"""Project each group in the input data onto the corresponding principal components."""
-		return self.fit(data, y, columns_by_group=columns_by_group).transform(data)
+		transformed_groups = self._fit_groups(
+			data,
+			columns_by_group=columns_by_group,
+			return_transformed=True,
+		)
+		return pl.concat(transformed_groups, how="horizontal").rechunk()
 
 	def get_feature_names_out(
 		self,
-		input_features: Sequence[str] | None = None,
+		input_features: Sequence[str] | None = None,  # ruff: ignore[ARG002]
 	) -> np.ndarray:
-		"""Return names for the transformed PCA features."""
-		check_is_fitted(self, ("models_", "n_features_in_"))
+		"""Return names for the transformed PCA features.
 
-		if input_features is not None:
-			provided_features = np.asarray(input_features, dtype=object)
+		Argument input_features is ignored.
+		"""
+		check_is_fitted(self, "feature_names_out_")
 
-			if provided_features.ndim != 1:
-				errmsg = "input_features must be a one-dimensional sequence."
-				raise ValueError(errmsg)
-
-			if len(provided_features) != self.n_features_in_:
-				errmsg = (
-					f"input_features has {len(provided_features)} features, "
-					f"but GroupwisePCA was fitted with {self.n_features_in_} features."
-				)
-				raise ValueError(errmsg)
-
-			if hasattr(self, "feature_names_in_") and not np.array_equal(
-				provided_features,
-				self.feature_names_in_,
-			):
-				errmsg = "input_features must match feature_names_in_ exactly."
-				raise ValueError(errmsg)
-
-		return np.asarray(
-			[
-				f"pca_{component}-{group}"
-				for group, model_info in self.models_.items()
-				for component in range(model_info["n_components"])
-			],
-			dtype=object,
-		)
+		return np.asarray(self.feature_names_out_, dtype=object)

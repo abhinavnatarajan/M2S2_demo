@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, TypeGuard, cast, get_args
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard, cast, get_args
 
 import numpy as np
 import polars as pl
@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import sklearn
 from chalc.sixpack.types import DiagramName
-from sklearn.base import BaseEstimator, clone
+from sklearn.base import clone
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
 from sklearn.metrics import brier_score_loss
@@ -30,9 +30,14 @@ from sklearn.pipeline import Pipeline
 from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
-	from collections.abc import Callable, Sequence
+	from collections.abc import Callable, Mapping, Sequence
 
 	from numpy.typing import ArrayLike
+
+	type NDArray1[M: np.integer | np.floating] = np.ndarray[tuple[int], np.dtype[M]]
+
+	type ScoreFunc = Callable[[ArrayLike, ArrayLike], float]
+
 
 from utils.logging import configure_logger
 from utils.pca import GroupwisePCA
@@ -51,13 +56,12 @@ __all__ = [
 SAMPLE_TYPES_ENUM = pl.Enum(["adenoma", "cancer"])
 
 
-@dataclass(slots=True)
 class FeatureParts:
 	"""Lazily parse a feature name into its components."""
 
 	dgm_and_dim: str
-	_dgm: DiagramName | None
-	_dim: int | None
+	_dgm: DiagramName
+	_dim: int
 	statistic: str
 	codomain: str
 	NUM_FEATURE_NAME_PARTS: ClassVar[int] = 3
@@ -78,13 +82,11 @@ class FeatureParts:
 			errmsg = f"Invalid feature name: {feature_name!r}"
 			raise ValueError(errmsg)
 		self.dgm_and_dim = tokens[0]
-		self._dgm = None
-		self._dim = None
 		self.statistic = tokens[1]
 		self.codomain = tokens[2]
 
 	def _parse_dgm_and_dim(self) -> None:
-		if self._dim is not None and self._dgm is not None:
+		if hasattr(self, "_dim") and hasattr(self, "_dgm"):
 			return
 		match = re.fullmatch(rf"({self.DGM_NAMES_REGEX})(\d+)", self.dgm_and_dim)
 		if not match:
@@ -96,17 +98,42 @@ class FeatureParts:
 	@property
 	def dim(self) -> int:
 		self._parse_dgm_and_dim()
-		return cast("int", self._dim)
+		return self._dim
 
 	@property
 	def dgm(self) -> DiagramName:
 		self._parse_dgm_and_dim()
-		return cast("DiagramName", self._dgm)
+		return self._dgm
+
+
+@dataclass(slots=True)
+class ClassificationParams:
+	"""Parameters for classification."""
+
+	pipeline: Pipeline = field(kw_only=True)
+	"""Base model for classification."""
+	splitter: StratifiedKFold = field(kw_only=True)
+	"""Splitter for the cross-validation diagnostic."""
+	num_permutations: int = field(kw_only=True)
+	"""Number of random permutations to use to estimate permutation importance scores."""
+	permutations_seed: int = field(kw_only=True)
+	"""Seed to generate the random permutations for feature importance testing."""
+	score_func: ScoreFunc = field(kw_only=True)
+	"""Score function to evaluate a prediction."""
+
+
+class FittedClassifier(Protocol):
+	"""A fitted classifier that provides class probabilities."""
+
+	classes_: ArrayLike
+	def predict_proba(self, data: ArrayLike) -> np.ndarray:
+		"""Predict class probabilities."""
+		...
 
 
 def get_patient_ids(
 	*stat_dump_dirs: PathLike,
-) -> np.ndarray[tuple[int], np.dtype[np.int64]]:
+) -> NDArray1[np.integer]:
 	"""Retrieve the list of patient IDs from the saved stats."""
 	logging.getLogger(__name__).info("Reading list of patient IDs.")
 	# Read the dataset
@@ -210,20 +237,67 @@ def read_patient_data(
 	)
 
 
-@dataclass(slots=True)
-class ClassificationParams:
-	"""Parameters for classification."""
+def get_permutation_importance_scores(
+	data: pl.DataFrame,
+	y: NDArray1[np.integer],
+	*,
+	reference_score: float,
+	positive_class: int,
+	group_columns: Mapping[str, Sequence[str]],
+	fitted_classifier: FittedClassifier,
+	permutations_seed: int,
+	score_func: ScoreFunc,
+	num_permutations: int,
+) -> dict[str, NDArray1[np.floating]]:
+	"""Evaluate grouped permutation importance using a fitted classifer."""
+	# Pre-generate the same permutations to use for all groups
+	rng = np.random.default_rng(permutations_seed)
+	permutations = [rng.permutation(data.height) for _ in range(num_permutations)]
 
-	classifier: BaseEstimator = field(kw_only=True)
-	"""Base model for classification."""
-	splitter: StratifiedKFold = field(kw_only=True)
-	"""Splitter for the cross-validation diagnostic."""
-	num_permutations: int = field(kw_only=True)
-	"""Number of random permutations to use to estimate permutation importance scores."""
-	permutations_seed: int = field(kw_only=True)
-	"""Seed to generate the random permutations for feature importance testing."""
-	score_func: Callable[[ArrayLike, ArrayLike], float] = field(kw_only=True)
-	"""Score function to evaluate a prediction."""
+	# Each group importance is a distribution, not a single number
+	groups = list(group_columns.keys())
+	group_importance_distributions = {
+		group: np.empty(num_permutations, dtype=float) for group in groups
+	}
+	for group in tqdm(
+		groups,
+		desc="Group",
+		leave=False,
+	):
+		cur_group_columns = group_columns[group]
+		for permutation_index, permutation in tqdm(
+			enumerate(permutations),
+			total=len(permutations),
+			desc="Permutation",
+			leave=False,
+		):
+			data_pca_permuted = data.update(
+				data.select(cur_group_columns).gather(permutation),
+			)
+			permuted_predictions = predict_class_probability(
+				fitted_classifier,
+				data_pca_permuted,
+				positive_class,
+			)
+			permuted_score = score_func(y, permuted_predictions)
+			group_importance_distributions[group][permutation_index] = (
+				reference_score - permuted_score
+			)
+	return group_importance_distributions
+
+
+def predict_class_probability(
+	classifier: FittedClassifier,
+	data_test: pl.DataFrame,
+	class_label: int,
+) -> NDArray1[np.floating]:
+	"""Predict the probability of specific class using a fitted classifier."""
+	classes_: NDArray1[np.integer] = np.asarray(classifier.classes_)
+	positive_class_indices = np.flatnonzero(classes_ == class_label)
+	if len(positive_class_indices) != 1:
+		errmsg = f"Could not identify the positive class in {classes_.tolist()}."
+		raise RuntimeError(errmsg)
+	return classifier.predict_proba(data_test)[:, positive_class_indices.item()]
 
 
 def run_classification_single_patient(  # noqa: C901, PLR0915
@@ -247,7 +321,9 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 		return {}
 
 	# Prediction target
-	y = data.get_column("sample_type").to_physical().to_numpy()
+	y: NDArray1[np.integer] = (
+		data.get_column("sample_type").to_physical().to_numpy()
+	)
 
 	# If the target has only samples of a given type, return an empty dictionary
 	classes, class_counts = np.unique(y, return_counts=True)
@@ -258,6 +334,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 			f"Expected {len(SAMPLE_TYPES_ENUM.categories)} sample types, got {classes.tolist()}."
 		)
 		raise ValueError(errmsg)
+	positive_class = classes.max().item()
 
 	# Parameter validation
 	if classification_params.num_permutations < 1:
@@ -285,21 +362,10 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	cell_groups = sorted(
 		{parsed_column_name.codomain for parsed_column_name in parsed_column_names},
 	)
-	cell_group_columns = {cell_group: [] for cell_group in cell_groups}
+	cell_group_columns: dict[str, list[str]] = {cell_group: [] for cell_group in cell_groups}
 	for column, parsed_column_name in zip(data.columns, parsed_column_names, strict=True):
 		cell_group = parsed_column_name.codomain
 		cell_group_columns[cell_group].append(column)
-
-	def predict_positive_probability(
-		estimator: BaseEstimator,
-		data_test: pl.DataFrame,
-	) -> np.ndarray:
-		classes_: np.ndarray[tuple[int], np.dtype[np.integer]] = np.asarray(estimator.classes_)
-		positive_class_indices = np.flatnonzero(classes_ == classes.max())
-		if len(positive_class_indices) != 1:
-			errmsg = f"Could not identify the positive class in {classes_.tolist()}."
-			raise RuntimeError(errmsg)
-		return estimator.predict_proba(data_test)[:, positive_class_indices.item()]
 
 	# Run one cross-validation pass as an overfitting diagnostic.
 	cv_train_scores = np.empty(n_splits, dtype=float)
@@ -318,14 +384,17 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	):
 		data_train = data.gather(train_idxs)
 		data_test = data.gather(test_idxs)
-		estimator = clone(classification_params.classifier)
-		estimator.fit(
-			data_train,
-			y[train_idxs],
-			columns_by_group=cell_group_columns,
+		estimator = cast("Pipeline", clone(classification_params.pipeline))
+		estimator = cast(
+			"FittedClassifier",
+			estimator.fit(
+				data_train,
+				y[train_idxs],
+				columns_by_group=cell_group_columns,
+			),
 		)
-		train_predictions = predict_positive_probability(estimator, data_train)
-		test_predictions = predict_positive_probability(estimator, data_test)
+		train_predictions = predict_class_probability(estimator, data_train, positive_class)
+		test_predictions = predict_class_probability(estimator, data_test, positive_class)
 		cv_train_scores[fold_index] = classification_params.score_func(
 			y[train_idxs],
 			train_predictions,
@@ -336,8 +405,15 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 		)
 		oof_predictions[test_idxs] = test_predictions
 
-		baseline_estimator = DummyClassifier().fit(data_train, y[train_idxs])
-		baseline_predictions = predict_positive_probability(baseline_estimator, data_test)
+		baseline_estimator = cast(
+			"FittedClassifier",
+			DummyClassifier().fit(data_train, y[train_idxs]),
+		)
+		baseline_predictions = predict_class_probability(
+			baseline_estimator,
+			data_test,
+			positive_class,
+		)
 		oof_baseline_predictions[test_idxs] = baseline_predictions
 		cv_baseline_test_scores[fold_index] = classification_params.score_func(
 			y[test_idxs],
@@ -345,39 +421,53 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 		)
 	cv_oof_score = classification_params.score_func(y, oof_predictions)
 
-	# Fit one final model to all observations and evaluate grouped permutation importance.
-	final_model = clone(classification_params.classifier)
-	final_model.fit(data, y, columns_by_group=cell_group_columns)
-	final_model_predictions = predict_positive_probability(final_model, data)
-	final_model_score = classification_params.score_func(y, final_model_predictions)
-	rng = np.random.default_rng(classification_params.permutations_seed)
-	permutations = [
-		rng.permutation(data.height) for _ in range(classification_params.num_permutations)
-	]
-	group_importance_distributions = {
-		cell_group: np.empty(classification_params.num_permutations, dtype=float)
-		for cell_group in cell_groups
-	}
-	for cell_group in tqdm(
-		cell_groups,
-		desc="Cell group",
-		leave=False,
-	):
-		group_columns = cell_group_columns[cell_group]
-		for permutation_index, permutation in tqdm(
-			enumerate(permutations),
-			desc="Permutation",
-			leave=False,
-		):
-			data_permuted = data.update(
-				data.select(group_columns).gather(permutation),
-			)
-			permuted_predictions = predict_positive_probability(final_model, data_permuted)
-			permuted_score = classification_params.score_func(y, permuted_predictions)
-			group_importance_distributions[cell_group][permutation_index] = (
-				final_model_score - permuted_score
-			)
+	final_model = cast("Pipeline", clone(classification_params.pipeline))
 
+	# Optimization: GroupwisePCA is equivariant to permutations in the input rows.
+	# So after permuting we needn't compute PCA again.
+	# We will compute PCA on the dataset once, and only run permutations post PCA.
+	if not isinstance(final_model, Pipeline):
+		errmsg = (
+			"The current implementation of grouped permutation "
+			"importance requires a fitted pipeline."
+		)
+		raise TypeError(errmsg)
+
+	final_model.fit(data, y, columns_by_group=cell_group_columns)
+	fitted_pca = final_model.named_steps.get("pca")
+
+	if not isinstance(fitted_pca, GroupwisePCA):
+		errmsg = "Pipeline step 'pca' must be a fitted GroupwisePCA."
+		raise TypeError(errmsg)
+
+	fitted_classifier = final_model.named_steps.get("classification")
+	if fitted_classifier is None:
+		errmsg = "Pipeline is missing the 'classification' step."
+		raise ValueError(errmsg)
+
+	# Compute grouped PCA once for the whole dataset
+	data_pca = fitted_pca.transform(data)
+
+	# Predictions against the fitted model to use as a baseline score.
+	# The decrease in importance after permuting is evaluated
+	# against this score.
+	final_model_predictions = predict_class_probability(fitted_classifier, data_pca, positive_class)
+	final_model_score = classification_params.score_func(y, final_model_predictions)
+
+	pca_columns_by_group = {
+		group: group_model.output_names for group, group_model in fitted_pca.models_.items()
+	}
+	group_importance_distributions = get_permutation_importance_scores(
+		data_pca,
+		y,
+		reference_score=final_model_score,
+		positive_class=positive_class,
+		group_columns=pca_columns_by_group,
+		fitted_classifier=fitted_classifier,
+		permutations_seed=classification_params.permutations_seed,
+		score_func=classification_params.score_func,
+		num_permutations=classification_params.num_permutations,
+	)
 	return {
 		"cv_train_scores": cv_train_scores,
 		"cv_test_scores": cv_test_scores,
@@ -506,7 +596,7 @@ def run_classification_all_patients(
 		)
 
 		classification_params = ClassificationParams(
-			classifier=classifier,
+			pipeline=classifier,
 			splitter=splitter,
 			num_permutations=num_permutations,
 			permutations_seed=0,
