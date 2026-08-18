@@ -491,7 +491,7 @@ def save_classification_results(
 	output_dir: PathLike,
 ) -> None:
 	"""Write classification results to parquet files."""
-	logging.getLogger(__name__).info("Saving classification results to %s", output_dir)
+	logging.getLogger(__name__).debug("Saving classification results to %s", output_dir)
 	output_path = Path(output_dir).resolve()
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	result_table: pa.Table = pl.from_dicts(classification_results).to_arrow()
