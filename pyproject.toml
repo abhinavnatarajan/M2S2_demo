@@ -12,7 +12,7 @@ authors = [
 	{ name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
 ]
 dependencies = [
-	"chalc~=14.0.0",
+	"chalc~=14.0",
 	"tqdm~=4.66",
 	"gudhi~=3.10",
 	"scikit-tda~=1.0",
@@ -22,17 +22,26 @@ dependencies = [
 	"ipywidgets~=8.1",
 	"shapely~=2.0",
 	"tables~=3.10",
-	"ipykernel~=6.29.5",
+	"ipykernel~=6.29",
 	"ipympl~=0.9",
-	"polars~=1.43.2",
-	"pyarrow~=25.0.1",
+	"polars~=1.43",
+	"pyarrow~=25.0",
+	"marimo~=0.24.0",
+	"plotly~=6.9",
 ]
+
+[dependency-groups]
+dev = [
+    "marimo[lsp]~=0.24.0",
+    "pyrefly~=1.2",
+    "types-tqdm~=4.70",
+]
+
+[tool.pyrefly]
+preset = "default"
 
 [tool.setuptools]
 packages = ["utils", "colorectal_cancer_dataset_analysis"]
-
-[tool.pyright]
-typeCheckingMode = "standard"
 
 [tool.ruff]
 line-length = 100

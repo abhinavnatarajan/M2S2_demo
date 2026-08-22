@@ -20,3 +20,5 @@ __pycache__
 .ruff_cache
 /colorectal_cancer_dataset_analysis/stats_singles_and_pairs
 /colorectal_cancer_dataset_analysis/stats_triples
+/colorectal_cancer_dataset_analysis/results
+**/__marimo__
