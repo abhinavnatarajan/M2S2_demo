@@ -1132,16 +1132,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "chalc", specifier = "~=14.0.0" },
+    { name = "chalc", specifier = "~=14.0" },
     { name = "gudhi", specifier = "~=3.10" },
-    { name = "ipykernel", specifier = "~=6.29.5" },
+    { name = "ipykernel", specifier = "~=6.29" },
     { name = "ipympl", specifier = "~=0.9" },
     { name = "ipywidgets", specifier = "~=8.1" },
     { name = "jupyterlab", specifier = "~=4.2" },
     { name = "marimo", specifier = "~=0.24.0" },
-    { name = "plotly", specifier = "~=6.9.0" },
-    { name = "polars", specifier = "~=1.43.2" },
-    { name = "pyarrow", specifier = "~=25.0.1" },
+    { name = "plotly", specifier = "~=6.9" },
+    { name = "polars", specifier = "~=1.43" },
+    { name = "pyarrow", specifier = "~=25.0" },
     { name = "scikit-learn", specifier = "~=1.8" },
     { name = "scikit-tda", specifier = "~=1.0" },
     { name = "scipy", specifier = "~=1.14" },
@@ -1153,8 +1153,8 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "marimo", extras = ["lsp"], specifier = "~=0.24.0" },
-    { name = "pyrefly", specifier = ">=1.2.0" },
-    { name = "types-tqdm", specifier = "~=4.70.0.20260805" },
+    { name = "pyrefly", specifier = "~=1.2" },
+    { name = "types-tqdm", specifier = "~=4.70" },
 ]
 
 [[package]]

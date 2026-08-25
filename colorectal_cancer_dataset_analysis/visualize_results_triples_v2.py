@@ -15,7 +15,7 @@ with app.setup:
 @app.cell
 def _():
     classification_pairs_df = pl.read_parquet(
-    	"./colorectal_cancer_dataset_analysis/results/classification_pairs_v2/**/*.parquet",
+    	"./colorectal_cancer_dataset_analysis/results/classification_triples_v2/**/*.parquet",
     	hive_partitioning=True,
     ).select(
     	"patient_id",
@@ -390,6 +390,243 @@ def _(
     	[
     		reweight_by_num_samples_checkbox,
     		feature_importance_across_patients_chart,
+    	]
+    )
+    return
+
+
+@app.cell
+def _(cell_group_importance_by_patient_df, classification_pairs_df):
+    from sklearn.decomposition import PCA as _PCA
+
+    _pca_cell_groups = cell_group_importance_by_patient_df[
+    	"cell_group"
+    ].to_list()
+    _pca_patient_ids = sorted(
+    	classification_pairs_df["patient_id"].unique().to_list()
+    )
+    _pca_importance_mappings = cell_group_importance_by_patient_df[
+    	"avg_importance_by_patient"
+    ].to_list()
+    patient_feature_importance_vectors_df = pl.DataFrame(
+    	{
+    		"patient_id": _pca_patient_ids,
+    		**{
+    			_cell_group: [
+    				float(_importance_mapping[_patient_id])
+    				for _patient_id in _pca_patient_ids
+    			]
+    			for _cell_group, _importance_mapping in zip(
+    				_pca_cell_groups,
+    				_pca_importance_mappings,
+    			)
+    		},
+    	}
+    )
+
+    _patient_importance_matrix = patient_feature_importance_vectors_df.select(
+    	_pca_cell_groups
+    ).to_numpy()
+    _pca_model = _PCA(n_components=3)
+    _patient_pca_scores = _pca_model.fit_transform(_patient_importance_matrix)
+    _pca_component_names = ["PCA1", "PCA2", "PCA3"]
+    _pca_explained_variance_percent = 100 * _pca_model.explained_variance_ratio_
+
+    patient_pca_scores_df = pl.DataFrame(
+    	{
+    		"patient_id": _pca_patient_ids,
+    		**{
+    			_component_name: _patient_pca_scores[:, _component_index]
+    			for _component_index, _component_name in enumerate(
+    				_pca_component_names
+    			)
+    		},
+    	}
+    )
+    _pca_scatter_data = patient_pca_scores_df.to_dict(as_series=False)
+    patient_pca_scatter = px.scatter_3d(
+    	_pca_scatter_data,
+    	x="PCA1",
+    	y="PCA2",
+    	z="PCA3",
+    	hover_name="patient_id",
+    	labels={
+    		_component_name: (
+    			f"{_component_name} "
+    			f"({_pca_explained_variance_percent[_component_index]:.1f}% variance)"
+    		)
+    		for _component_index, _component_name in enumerate(
+    			_pca_component_names
+    		)
+    	},
+    	title="Patients in feature-importance PCA space",
+    )
+    patient_pca_scatter.update_traces(
+    	marker={"size": 6, "opacity": 0.8},
+    	hovertemplate=(
+    		"<b>Patient %{hovertext}</b><br>"
+    		"PCA1: %{x:.4g}<br>"
+    		"PCA2: %{y:.4g}<br>"
+    		"PCA3: %{z:.4g}<extra></extra>"
+    	),
+    )
+    patient_pca_scatter.update_layout(height=700)
+
+    pca_component_loadings_df = pl.DataFrame(
+    	{
+    		"cell_group": _pca_cell_groups * 3,
+    		"component": [
+    			_component_name
+    			for _component_name in _pca_component_names
+    			for _ in _pca_cell_groups
+    		],
+    		"loading": _pca_model.components_.reshape(-1),
+    	}
+    )
+
+    def _make_pca_loading_chart(_component_index):
+    	_component_name = _pca_component_names[_component_index]
+    	_component_loadings = _pca_model.components_[_component_index]
+    	_top_indices = np.argsort(_component_loadings)[::-1][:10]
+    	_top_cell_groups = [_pca_cell_groups[_index] for _index in _top_indices]
+    	_top_loadings = _component_loadings[_top_indices]
+    	_chart = go.Figure(
+    		go.Bar(
+    			x=_top_loadings,
+    			y=_top_cell_groups,
+    			orientation="h",
+    			marker_color="#636EFA",
+    			hovertemplate=(
+    				"<b>%{y}</b><br>"
+    				+ _component_name
+    				+ " loading: %{x:.5f}<extra></extra>"
+    			),
+    		)
+    	)
+    	_chart.update_layout(
+    		title=(
+    			f"{_component_name} loadings "
+    			f"({_pca_explained_variance_percent[_component_index]:.1f}% variance explained)"
+    			"<br><sup>Top 10 cell groups by loading, highest first</sup>"
+    		),
+    		xaxis_title="PCA loading coefficient",
+    		yaxis_title="Cell group",
+    		height=500,
+    		showlegend=False,
+    		margin={"l": 260},
+    		yaxis={
+    			"categoryorder": "array",
+    			"categoryarray": _top_cell_groups,
+    			"autorange": "reversed",
+    		},
+    	)
+    	return _chart
+
+    pca1_loadings_chart = _make_pca_loading_chart(0)
+    pca2_loadings_chart = _make_pca_loading_chart(1)
+    pca3_loadings_chart = _make_pca_loading_chart(2)
+
+    mo.vstack(
+    	[
+    		mo.md(
+    			f"**PCA input:** {len(_pca_patient_ids)} patients x "
+    			f"{len(_pca_cell_groups)} cell groups. The first three components "
+    			f"explain {_pca_explained_variance_percent.sum():.1f}% of the variance. "
+    			"Component signs are arbitrary; the loading magnitudes show each "
+    			"cell group's contribution."
+    		),
+    		patient_pca_scatter,
+    		pca1_loadings_chart,
+    		pca2_loadings_chart,
+    		pca3_loadings_chart,
+    	]
+    )
+    return
+
+
+@app.cell
+def _(cell_group_importance_by_patient_df):
+    _frequency_cell_groups = cell_group_importance_by_patient_df[
+    	"cell_group"
+    ].to_list()
+    _frequency_importance_mappings = cell_group_importance_by_patient_df[
+    	"avg_importance_by_patient"
+    ].to_list()
+    _frequency_patient_ids = sorted(_frequency_importance_mappings[0])
+    _top5_cell_group_counts = dict.fromkeys(_frequency_cell_groups, 0)
+
+    for _patient_id in _frequency_patient_ids:
+    	_ranked_cell_groups = sorted(
+    		zip(_frequency_cell_groups, _frequency_importance_mappings),
+    		key=lambda _item: (
+    			-float(_item[1][_patient_id]),
+    			_item[0],
+    		),
+    	)
+    	for _cell_group, _ in _ranked_cell_groups[:5]:
+    		_top5_cell_group_counts[_cell_group] += 1
+
+    _top20_cell_group_frequencies = sorted(
+    	_top5_cell_group_counts.items(),
+    	key=lambda _item: (-_item[1], _item[0]),
+    )[:20]
+    top_cell_group_frequency_df = pl.DataFrame(
+    	{
+    		"cell_group": [
+    			_cell_group for _cell_group, _ in _top20_cell_group_frequencies
+    		],
+    		"patient_count": [
+    			_count for _, _count in _top20_cell_group_frequencies
+    		],
+    	}
+    )
+    _frequency_chart_cell_groups = top_cell_group_frequency_df[
+    	"cell_group"
+    ].to_list()
+    _frequency_chart_patient_counts = top_cell_group_frequency_df[
+    	"patient_count"
+    ].to_list()
+    top_cell_group_frequency_chart = go.Figure(
+    	go.Bar(
+    		x=_frequency_chart_patient_counts,
+    		y=_frequency_chart_cell_groups,
+    		orientation="h",
+    		text=_frequency_chart_patient_counts,
+    		textposition="outside",
+    		cliponaxis=False,
+    		marker_color="#636EFA",
+    		hovertemplate=(
+    			"<b>%{y}</b><br>"
+    			"Appears in top 5 for %{x} patients<extra></extra>"
+    		),
+    	)
+    )
+    top_cell_group_frequency_chart.update_layout(
+    	title=(
+    		"Most frequent cell groups among each patient's top 5"
+    		"<br><sup>Cell groups are ranked per patient by average feature importance</sup>"
+    	),
+    	xaxis_title="Number of patients",
+    	yaxis_title="Cell group",
+    	height=550,
+    	showlegend=False,
+    	margin={"l": 260, "r": 60},
+    	xaxis={"dtick": 1, "rangemode": "tozero"},
+    	yaxis={
+    		"categoryorder": "array",
+    		"categoryarray": _frequency_chart_cell_groups,
+    		"autorange": "reversed",
+    	},
+    )
+
+    mo.vstack(
+    	[
+    		mo.md(
+    			f"Across {len(_frequency_patient_ids)} patients, these are the 20 "
+    			"cell groups that most often appear among a patient's five highest "
+    			"average feature importances."
+    		),
+    		top_cell_group_frequency_chart,
     	]
     )
     return
