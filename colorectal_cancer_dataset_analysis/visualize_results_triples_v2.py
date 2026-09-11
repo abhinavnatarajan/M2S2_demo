@@ -10,9 +10,14 @@ with app.setup:
     import numpy as np
     import plotly.express as px
     import plotly.graph_objects as go
+    config = {
+        "toImageButtonOptions": {
+            "format": "svg",
+        }
+    }
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     classification_pairs_df = pl.read_parquet(
     	"./colorectal_cancer_dataset_analysis/results/classification_triples_v2/**/*.parquet",
@@ -27,7 +32,7 @@ def _():
     return (classification_pairs_df,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(classification_pairs_df):
     patient_score_summary_df = (
     	classification_pairs_df.with_columns(
@@ -77,7 +82,7 @@ def _(classification_pairs_df):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(classification_pairs_df):
     _patient_ids = classification_pairs_df["patient_id"].sort().to_list()
     patient_id_dropdown = mo.ui.dropdown(
@@ -89,7 +94,7 @@ def _(classification_pairs_df):
     return (patient_id_dropdown,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(classification_pairs_df, patient_id_dropdown):
     _selected_feature_importances = (
     	classification_pairs_df.filter(
@@ -133,7 +138,7 @@ def _(classification_pairs_df, patient_id_dropdown):
     		).alias("box_upper"),
     	)
     	.sort("average_importance", descending=True)
-    	.head(20)
+    	.head(10)
     )
     _feature_importance_hover_data = _feature_importance_data.select(
     	"average_importance",
@@ -174,7 +179,7 @@ def _(classification_pairs_df, patient_id_dropdown):
     			"<extra></extra>"
     		),
     		name="",
-    	)
+    	),
     )
     feature_importance_chart.update_layout(
     	title=(
@@ -193,11 +198,11 @@ def _(classification_pairs_df, patient_id_dropdown):
     	height=700,
     	showlegend=False,
     )
-    mo.vstack([patient_id_dropdown, feature_importance_chart])
+    mo.vstack([patient_id_dropdown, mo.ui.plotly(feature_importance_chart, config=config)])
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(classification_pairs_df):
     _feature_importance_rows = list(
     	classification_pairs_df.select("patient_id", "feature_importances")
@@ -227,7 +232,7 @@ def _(classification_pairs_df):
     return (cell_group_importance_by_patient_df,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     reweight_by_num_samples_checkbox = mo.ui.checkbox(
     	value=False,
@@ -236,7 +241,7 @@ def _():
     return (reweight_by_num_samples_checkbox,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(
     cell_group_importance_by_patient_df,
     classification_pairs_df,
@@ -395,7 +400,7 @@ def _(
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(cell_group_importance_by_patient_df, classification_pairs_df):
     from sklearn.decomposition import PCA as _PCA
 
@@ -544,7 +549,7 @@ def _(cell_group_importance_by_patient_df, classification_pairs_df):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(cell_group_importance_by_patient_df):
     _frequency_cell_groups = cell_group_importance_by_patient_df[
     	"cell_group"
