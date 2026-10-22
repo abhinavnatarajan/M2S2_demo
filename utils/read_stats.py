@@ -5,10 +5,11 @@ from os import PathLike
 from pathlib import Path
 from typing import Literal, get_args
 
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
-from chalc.sixpack.types import DiagramName
+
+from .stat_schema import DiagramName
 
 __all__ = ["read_stats"]
 
@@ -17,14 +18,14 @@ DGM_NAMES_REGEX: str = f"({'|'.join(get_args(DiagramName.__value__))}"
 
 def read_stats(
 	stat_dir: PathLike,
-	table_format: Literal["parquet", "pyarrow", "pandas"] = "parquet",
+	table_format: Literal["parquet", "pyarrow", "polars"] = "parquet",
 	**kwargs,
-) -> pq.ParquetDataset | pa.Table | pd.DataFrame:
+) -> pq.ParquetDataset | pa.Table | pl.DataFrame:
 	"""Read the statistics computed by `generate_stats` from a specified directory.
 
 	This function allows for reading the computed statistics in different formats,
 	supporting "parquet" for raw ParquetDataset objects, "pyarrow" for PyArrow Table objects,
-	and "pandas" for pandas DataFrame objects. This flexibility is useful for different downstream
+	and "polars" for Polars DataFrame objects. This flexibility is useful for different downstream
 	analysis tasks which may require specific data formats.
 
 	Parameters
@@ -32,15 +33,15 @@ def read_stats(
 	stat_dir : Pathlike
 			The directory from which to read the computed statistics.
 			This should be the same directory specified
-			as the `output_dir` in `generate_stats_pairs`.
-	table_format : (Literal["parquet", "pyarrow", "pandas"], optional)
+			as the `output_dir` in `generate_stats`.
+	table_format : (Literal["parquet", "pyarrow", "polars"], optional)
 			The format in which to read the statistics. Defaults to "parquet".
 	**kwargs:
-			Additional keyword arguments to pass to the `pyarrow.dataset.dataset` function.
+			Additional keyword arguments to pass to `pyarrow.parquet.ParquetDataset`.
 
 	Returns
 	-------
-	pyarrow.parquet.ParquetDataset | pyarrow.Table | pandas.DataFrame:
+	pyarrow.parquet.ParquetDataset | pyarrow.Table | polars.DataFrame:
 			The computed statistics in the specified format.
 			The exact type of the return value depends on the `format` parameter.
 
@@ -52,11 +53,13 @@ def read_stats(
 	Examples
 	--------
 	```python
-	stats_df = read_stats_pairs("/path/to/stats", format="pandas")
+	stats_df = read_stats("/path/to/stats", table_format="polars")
 	print(stats_df.head())
 	```
 
 	"""
+	if table_format not in ("parquet", "pyarrow", "polars"):
+		raise ValueError("Invalid format specified. Use 'parquet', 'pyarrow', or 'polars'.")
 	stat_path = Path(stat_dir).resolve()
 	dataset = pq.ParquetDataset(stat_path, **kwargs)
 	if table_format == "parquet":
@@ -64,11 +67,7 @@ def read_stats(
 	dataset = dataset.read()
 	if table_format == "pyarrow":
 		return dataset
-	dataset = dataset.to_pandas()
-	if table_format == "pandas":
-		return dataset
-	errmsg = "Invalid format specified. Use 'parquet', 'pyarrow', or 'pandas'."  # pyright: ignore[reportUnreachable]
-	raise ValueError(errmsg)
+	return pl.from_arrow(dataset)
 
 
 def stat_name_split(name: str) -> tuple[str, int, str]:

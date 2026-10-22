@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "M2S2_demo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multiscale Multi-species Spatial Signatures"
 license = "MIT"
 requires-python = "~=3.13.0"
@@ -12,7 +12,7 @@ authors = [
 	{ name = "Abhinav Natarajan", email = "abhinav.v.natarajan@gmail.com" },
 ]
 dependencies = [
-	"chalc~=14.0",
+	"chalc~=15.0",
 	"tqdm~=4.66",
 	"gudhi~=3.10",
 	"scikit-tda~=1.0",
@@ -32,8 +32,11 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "lefthook>=2.2.2",
     "marimo[lsp]~=0.24.0",
     "pyrefly~=1.2",
+    "ruff>=0.16.4",
+    "tombi>=1.9.0",
     "types-tqdm~=4.70",
 ]
 

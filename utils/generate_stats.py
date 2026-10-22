@@ -6,7 +6,7 @@ import os
 import pprint
 import sys
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from copy import deepcopy
 from functools import partial
 from itertools import chain, combinations
@@ -15,17 +15,20 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from chalc import chromatic
-from chalc.sixpack import KChromaticInclusion, KChromaticQuotient
-from pandas import DataFrame, Series, read_csv
+from chalc.morphisms import KChromaticGluing, KChromaticInclusion
 from tqdm import tqdm
+
+from utils.stat_schema import DiagramName
 
 from .logging import configure_logger
 from .parallel import PoolWithLogger
 from .persistent_stats import PERS_STATS_NAMES, get_pers_stats
+from .stat_schema import MODULE_TO_DIAGRAM
 
 __all__ = ["generate_stats", "make_cmdline_parser", "make_filename_index_map"]
 
@@ -33,8 +36,8 @@ __all__ = ["generate_stats", "make_cmdline_parser", "make_filename_index_map"]
 def default_data_loader(
 	filepath: Path,
 	_: dict[str, Any],
-) -> tuple[DataFrame, dict[str, Any]]:
-	return (read_csv(filepath, header=0, index_col=False), {})
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+	return (pl.read_csv(filepath, has_header=True, infer_schema_length=None), {})
 
 
 def generate_stats(
@@ -42,7 +45,7 @@ def generate_stats(
 	filename_index_map: Mapping[str, dict[str, Any]],
 	data_loader: Callable[
 		[Path, dict[str, Any]],
-		tuple[DataFrame, dict[str, Any]],
+		tuple[pl.DataFrame, dict[str, Any]],
 	] = default_data_loader,
 ) -> int:
 	"""Compute persistent statistics for all pairs of labels from datasets of labelled 2D data.
@@ -57,7 +60,7 @@ def generate_stats(
 	and labels of the labelled point cloud.
 	A set of labels L to consider is passed as an input parameter.
 	For each sample, the persistent statistics are computed for the 6-pack
-	corresponding to the k-chromatic quotient map.
+	corresponding to the k-chromatic gluing map (formerly called a quotient in chalc).
 	These statistics are saved to an Apache Parquet dataset with partitioning (see https://parquet.apache.org/).
 
 	Parameters
@@ -103,7 +106,7 @@ def generate_stats(
 	    to a dictionary of metadata describing the dataset in the file.
 	    The metadata must be unique between files, as it used for indexing.
 	    This dictionary will be added to the corresponding row in the output dataset.
-	data_loader : Callable[[Path, dict[str, Any]], tuple[DataFrame, dict[str,Any]]], optional
+	data_loader : Callable[[Path, dict[str, Any]], tuple[pl.DataFrame, dict[str,Any]]], optional
 	    A function that takes a file path and the index dictionary,
 	    and returns a DataFrame and a dictionary of metadata.
 	    The metadata dictionary can be used to add additional information to the stored statistics.
@@ -145,8 +148,8 @@ def generate_stats(
 		filename_index_map,
 		logger,
 	)
-	index_df = DataFrame(list(filename_index_map.values()))
-	max_partitions = max(index_df[col].nunique() for col in index_df.columns)
+	index_df = pl.DataFrame(list(filename_index_map.values()), infer_schema_length=None)
+	max_partitions = max(index_df[col].n_unique() for col in index_df.columns)
 	if dry_run:
 		logger.info("Dry run complete.")
 		sys.exit(0)
@@ -179,11 +182,15 @@ def generate_stats(
 				parallel,
 				logger,
 			)
-			results_df = DataFrame(results)
+			results_df = pl.DataFrame(results, infer_schema_length=None)
 			index_in_df = filename_index_map[filepath.stem]
-			for col in index_in_df:
-				results_df[col] = results_df[col].astype("category")
-			results_table = pa.Table.from_pandas(results_df, preserve_index=False)
+			# Preserve categorical string partition metadata; numeric IDs stay numeric.
+			results_df = results_df.with_columns(
+				pl.col(col).cast(pl.Categorical)
+				for col in index_in_df
+				if results_df.schema[col] == pl.String
+			)
+			results_table = results_df.to_arrow()
 			pq.write_to_dataset(
 				results_table,
 				root_path=output_path,
@@ -201,11 +208,18 @@ def generate_stats(
 def process_file(
 	filepath: Path,
 	filename_index_map: Mapping[str, dict],
-	data_loader: Callable[[Path, dict[str, Any]], tuple[DataFrame, dict]],
+	data_loader: Callable[[Path, dict[str, Any]], tuple[pl.DataFrame, dict]],
 	cmdline_args: argparse.Namespace,
 	par_pool: PoolWithLogger,
 	logger: logging.Logger,
 ) -> list[dict]:
+	"""Compute persistent stats for a single file.
+
+	`filename_index_map` should be the `filename -> metadata` mapping as in the
+	function :func:`generate_stats <utils.generate_stats>`.
+	`data_loader` is a function that reads the file and returns a data frame.
+	`cmdline_args` is passed here mainly to get the columns to read from the data frame.
+	"""
 	logger.debug("Reading %s...", filepath)
 
 	x_col: str = cmdline_args.x_column
@@ -223,17 +237,21 @@ def process_file(
 
 	index_dict = filename_index_map[filepath.stem]
 	data_df, metadata = data_loader(filepath, index_dict)
-	data_df = data_df.loc[:, [x_col, y_col, label_col]]
-	data_df[label_col] = data_df[label_col].astype("category")
-	if len(labels_include) > 0:
-		data_df = data_df.loc[data_df[label_col].isin(labels_include)]
-	if len(labels_exclude) > 0:
-		data_df = data_df.loc[~data_df[label_col].isin(labels_exclude)]
-	labels_retain: list[str] = sorted(
-		(
-			str(x)
-			for x in data_df[label_col].value_counts().loc[lambda c: c >= min_count].index.tolist()
-		),
+	data_df = data_df.select(x_col, y_col, label_col).with_columns(
+		pl.col(label_col).cast(pl.String).cast(pl.Categorical),
+	)
+	if labels_include:
+		data_df = data_df.filter(pl.col(label_col).is_in(labels_include))
+	if labels_exclude:
+		data_df = data_df.filter(~pl.col(label_col).is_in(labels_exclude))
+	labels_retain: list[str] = (
+		data_df.filter(pl.col(label_col).is_not_null())
+		.group_by(label_col)
+		.len()
+		.filter(pl.col("len") >= min_count)
+		.get_column(label_col)
+		.sort()
+		.to_list()
 	)
 	logger.debug("Begin computing stats for %s.", filepath.name)
 	metadata = metadata | index_dict
@@ -245,7 +263,7 @@ def process_file(
 		return [
 			metadata | {"codomain": None},
 		]
-	data_df = data_df.loc[data_df[label_col].isin(labels_retain)]
+	data_df = data_df.filter(pl.col(label_col).is_in(labels_retain))
 	logger.debug(
 		"Retaining the following labels for %s:\n%s",
 		filepath.name,
@@ -548,7 +566,7 @@ def make_filename_index_map(
 
 
 def get_stats_k_chromatic_quotient(
-	df: DataFrame,
+	df: pl.DataFrame,
 	x_col: str,
 	y_col: str,
 	label_col: str,
@@ -556,22 +574,28 @@ def get_stats_k_chromatic_quotient(
 	max_diagram_dimension: int,
 	codomain_types: tuple[str, ...],
 ) -> dict[str, tuple[str, ...] | np.float64]:
+	"""Compute gluing statistics."""
 	codomain_types = tuple(set(codomain_types))
 	num_labels = len(codomain_types)
 	k = num_labels - 1 if num_labels > 1 else 1
 	# Pull out points that are in the codomain
-	sub_df: DataFrame = df.loc[df[label_col].isin(codomain_types)]
-	points = sub_df[[x_col, y_col]].to_numpy().transpose()
+	sub_df = df.filter(pl.col(label_col).is_in(codomain_types))
+	points = sub_df.select(x_col, y_col).to_numpy().transpose()
 	# Re-index with integers
-	colours = sub_df[label_col].cat.codes.to_numpy()
+	colours = sub_df[label_col].cast(pl.Categorical).to_physical().to_numpy()
 	# Canonicalize the codomain types
 	colours = canonicalize_labels(colours)
 	# Pre-compute the filtration
 	filt = getattr(chromatic, filtration_algorithm)(points, colours)
 	logging.debug("Computing stats for codomain %s", codomain_types)  # noqa: LOG015
-	dgms = (KChromaticInclusion(filt, 1) if k == 1 else KChromaticQuotient(filt, k)).sixpack()
+	morphism = KChromaticInclusion(filt, 1) if k == 1 else KChromaticGluing(filt, k)
+	dgms = morphism.sixpack(max_homological_degree=max_diagram_dimension)
+	# Keep the paper's abbreviated column names and include empty degrees.
 	barcodes = {
-		name: dgms.get_matrix(name, list(range(max_diagram_dimension + 1))) for name in dgms
+		MODULE_TO_DIAGRAM[name]: [
+			module.intervals(degree) for degree in range(max_diagram_dimension + 1)
+		]
+		for name, module in dgms
 	}
 	stats: dict[str, tuple[str, ...] | np.float64] = {
 		"codomain": codomain_types,
@@ -580,13 +604,17 @@ def get_stats_k_chromatic_quotient(
 	return stats
 
 
-def canonicalize_labels(v: list[int]) -> np.ndarray[tuple[int], np.dtype[np.int_]]:
+def canonicalize_labels(
+	v: Sequence[int] | np.ndarray[tuple[int], np.dtype[np.integer]],
+) -> np.ndarray[tuple[int], np.dtype[np.int64]]:
 	label_set = set(v)
 	old_to_new = {label: new_label for new_label, label in enumerate(label_set)}
-	return np.array([old_to_new[label] for label in v], dtype=np.int_)
+	return np.array([old_to_new[label] for label in v], dtype=np.int64)
 
 
-def get_stats_from_barcodes_dict(barcodes: dict[str, list[np.ndarray]]) -> dict[str, np.float64]:
+def get_stats_from_barcodes_dict(
+	barcodes: dict[DiagramName, list[np.ndarray]],
+) -> dict[str, np.float64]:
 	stats: dict[str, np.float64] = {}
 	for diagram_name, barcodes_all_dims in barcodes.items():
 		for dim, barcode in enumerate(barcodes_all_dims):
@@ -670,18 +698,19 @@ def check_already_processed(
 		logger.info("Checking for existing stats...")
 		dataset_index_cols = list(filename_index_map[files_to_check[0].stem].keys())
 		try:
-			processed_records: DataFrame = (
-				ds.dataset(output_path, format="parquet", partitioning="hive")
-				.to_table(columns=dataset_index_cols)
-				.to_pandas()
-				.drop_duplicates()
-			)
+			processed_records = pl.DataFrame(
+				ds.dataset(output_path, format="parquet", partitioning="hive").to_table(
+					columns=dataset_index_cols,
+				),
+			).unique()
 		except (FileNotFoundError, pa.ArrowInvalid):
-			processed_records = DataFrame([], columns=Series(dataset_index_cols))
+			processed_records = pl.DataFrame(schema=dict.fromkeys(dataset_index_cols, pl.Null))
 
 		def already_processed(f: Path) -> bool:
-			record_to_check = Series(filename_index_map[f.stem])
-			return (processed_records == record_to_check).all(axis=1).any()
+			record = filename_index_map[f.stem]
+			return not processed_records.filter(
+				pl.all_horizontal(pl.col(col) == pl.lit(record[col]) for col in dataset_index_cols),
+			).is_empty()
 
 		if (m := len(processed_records)) > 0:
 			logger.info("Found existing stats for %d records.", m)

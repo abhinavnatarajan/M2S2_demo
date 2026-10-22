@@ -20,7 +20,6 @@ import polars.selectors as cs
 import pyarrow as pa
 import pyarrow.parquet as pq
 import sklearn
-from chalc.sixpack.types import DiagramName
 from sklearn.base import clone
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import BaggingClassifier, GradientBoostingClassifier
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
 from utils.logging import configure_logger
 from utils.pca import GroupwisePCA
 from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
+from utils.stat_schema import DiagramName
 
 sklearn.set_config(enable_metadata_routing=True)
 
