@@ -12,7 +12,12 @@ from scipy.linalg import svd
 from sklearn.base import BaseEstimator
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_is_fitted, validate_data
+
+# Pyrefly's bundled scikit-learn stubs omit validate_data (public since 1.6).
+from sklearn.utils.validation import (
+	check_is_fitted,
+	validate_data,  # pyrefly: ignore [missing-module-attribute]
+)
 
 if TYPE_CHECKING:
 	from collections.abc import Sequence
@@ -138,7 +143,7 @@ class GroupwisePCA(BaseEstimator):
 	"""Names of input features seen during fitting."""
 	feature_names_out_: Sequence[str]
 	"""Names of output features after PCA."""
-	models_: dict[str, GroupModel]
+	models_: dict[str, GroupwisePCA.GroupModel]
 	"""Mapping of group names to pipeline and metadata."""
 
 	@dataclass(slots=True)
@@ -323,7 +328,8 @@ class GroupwisePCA(BaseEstimator):
 
 	def get_feature_names_out(
 		self,
-		input_features: Sequence[str] | None = None,  # ruff: ignore[ARG002]
+		# ruff: ignore[ARG002]
+		input_features: Sequence[str] | None = None, # type: ignore[unused-parameter]
 	) -> np.ndarray:
 		"""Return names for the transformed PCA features.
 

@@ -1,4 +1,5 @@
 """Miscellaneous plotting tools."""
+
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
@@ -42,12 +43,8 @@ def weighted_violinplot(
 		data = dataset.filter(pl.col(group_by) == group)
 		kde = gaussian_kde(data[value], weights=data[weight])
 		value_col = data.get_column(value)
-		if not isinstance(
-			value_col.dtype,
-			pl.datatypes.IntegerType,
-		) or isinstance(
-			value_col.dtype,
-			pl.datatypes.FloatType,
+		if not (
+			isinstance(value_col.dtype, (pl.datatypes.IntegerType, pl.datatypes.FloatType))
 		):
 			raise TypeError
 		# pyrefly: ignore [no-matching-overload]

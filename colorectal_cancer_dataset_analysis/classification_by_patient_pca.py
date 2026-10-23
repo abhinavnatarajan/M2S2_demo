@@ -7,16 +7,14 @@ import argparse
 import logging
 import os
 import pprint
-import re
 import time
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard, cast, get_args
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 import polars as pl
-import polars.selectors as cs
 import pyarrow as pa
 import pyarrow.parquet as pq
 import sklearn
@@ -40,8 +38,8 @@ if TYPE_CHECKING:
 
 from utils.logging import configure_logger
 from utils.pca import GroupwisePCA
-from utils.persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
-from utils.stat_schema import DiagramName
+from utils.read_stats import read_feature_data
+from utils.stat_schema import FeatureParts
 
 sklearn.set_config(enable_metadata_routing=True)
 
@@ -54,56 +52,6 @@ __all__ = [
 ]
 
 SAMPLE_TYPES_ENUM = pl.Enum(["adenoma", "cancer"])
-
-
-class FeatureParts:
-	"""Lazily parse a feature name into its components."""
-
-	dgm_and_dim: str
-	_dgm: DiagramName
-	_dim: int
-	statistic: str
-	codomain: str
-	NUM_FEATURE_NAME_PARTS: ClassVar[int] = 3
-	DGM_NAMES_REGEX: ClassVar[str] = "|".join(
-		re.escape(name) for name in get_args(DiagramName.__value__)
-	)
-
-	@classmethod
-	def is_diagram_name(cls, name: str) -> TypeGuard[DiagramName]:
-		"""Check if a string is a diagram name."""
-		return name in get_args(DiagramName.__value__)
-
-	def __init__(self, feature_name: str) -> None:
-		# Expects feature names of the form <dgm><dim>-<statistic>-<cell_type/cell_type/...>
-		# such as ker0-avg_birth-cell1/cell2/cell3
-		tokens = feature_name.split("-", maxsplit=2)
-		if len(tokens) != self.NUM_FEATURE_NAME_PARTS:
-			errmsg = f"Invalid feature name: {feature_name!r}"
-			raise ValueError(errmsg)
-		self.dgm_and_dim = tokens[0]
-		self.statistic = tokens[1]
-		self.codomain = tokens[2]
-
-	def _parse_dgm_and_dim(self) -> None:
-		if hasattr(self, "_dim") and hasattr(self, "_dgm"):
-			return
-		match = re.fullmatch(rf"({self.DGM_NAMES_REGEX})(\d+)", self.dgm_and_dim)
-		if not match:
-			errmsg = f"Invalid diagram and dimension: {self.dgm_and_dim!r}"
-			raise ValueError(errmsg)
-		self._dgm = cast("DiagramName", match.group(1))
-		self._dim = int(match.group(2))
-
-	@property
-	def dim(self) -> int:
-		self._parse_dgm_and_dim()
-		return self._dim
-
-	@property
-	def dgm(self) -> DiagramName:
-		self._parse_dgm_and_dim()
-		return self._dgm
 
 
 @dataclass(slots=True)
@@ -126,6 +74,7 @@ class FittedClassifier(Protocol):
 	"""A fitted classifier that provides class probabilities."""
 
 	classes_: ArrayLike
+
 	def predict_proba(self, data: ArrayLike) -> np.ndarray:
 		"""Predict class probabilities."""
 		...
@@ -160,80 +109,15 @@ def read_patient_data(
 	keep_epithelium: bool = False,
 ) -> pl.DataFrame:
 	"""Read the data for a given patient."""
-	# Drop epithelium columns if they are not required
 	if not keep_epithelium:
 		labels_exclude += ("Epithelium (imm)", "Epithelium (str)")
-
-	# Filters a row based on the codomain cell group
-	codomain_in_labels_include = (
-		pl.col("codomain").list.set_difference(labels_include).list.len().eq(0)
-		if labels_include
-		else pl.lit(value=True)
-	)
-	codomain_not_in_labels_exclude = (
-		pl.col("codomain")
-		.list.set_intersection(
-			labels_exclude,
-		)
-		.list.len()
-		.eq(0)
-	)
-
-	# Some columns can be universally dropped without filtering the cell-groups.
-	# We can do this pre-pivot to save time.
-	dgm_names = r"(ker|cok|dom|cod|im|rel)"
-	pers_stats_names = rf"({('|').join(PERS_STATS_NAMES)})"
-	statistic_names = rf"({('|').join(STATISTIC_NAMES)})"
-	# Codomain and relative diagrams
-	cod_dgm = cs.matches(rf"cod\d+-{pers_stats_names}$")
-	rel_dgm = cs.matches(rf"rel\d+-{pers_stats_names}$")
-	cod_or_rel = cod_dgm | rel_dgm
-	# Cokernel in degree 0
-	cokernel_dim0 = cs.matches(rf"cok0-{pers_stats_names}$")
-	# Births are always 0 in dom0 and im0
-	# Midpts and length not required since we have death.
-	redundant_dim0_stats = cs.matches(rf"^(dom|im)0-{statistic_names}_(birth|midpt|length)$")
-	# Interquartile range not needed since we have p25 and p75
-	iqr = cs.matches(rf"^{dgm_names}\d+-iqr$")
-	pre_pivot_drop_cols = cod_or_rel | cokernel_dim0 | redundant_dim0_stats | iqr
-
-	# Post-pivot column selectors to drop
-	# Drop non-domain diagrams for single cell types
-	single_cell_type = cs.matches(rf"^{dgm_names}\d+-{pers_stats_names}-[^/]+$")
-	non_dom_single_cell_type = single_cell_type - cs.matches(rf"dom\d+-{pers_stats_names}-.+$")
-	# Drop dom diagram for multiple cell types
-	dom_multiple_cell_types = cs.matches(rf"^dom\d+-{pers_stats_names}-[^/]+/.+$")
-	post_pivot_drop_cols = non_dom_single_cell_type | dom_multiple_cell_types
-
-	patient_dfs: list[pl.LazyFrame] = []
-	for path in stat_dump_dirs:
-		logging.getLogger(__name__).debug(
-			"Reading data for patient id %s from %s.",
-			patient_id,
-			path,
-		)
-		stat_path = Path(path).resolve()
-		df: pl.LazyFrame = (
-			pl.scan_parquet(
-				stat_path,
-				hive_partitioning=True,
-				missing_columns="insert",
-			)
-			.filter(pl.col("patient_id") == patient_id)
-			.drop("filtration_algorithm", "patient_id", pre_pivot_drop_cols)
-			.drop_nulls(subset="codomain")
-			.filter(codomain_in_labels_include & codomain_not_in_labels_exclude)
-			.cast({"sample_type": SAMPLE_TYPES_ENUM})
-		)
-		patient_dfs.append(df)
-
-	# Output features are named "<diagram><dim>-<statistic>_<variable>-<cell/group/types>".
-	return (
-		pl.concat(patient_dfs, how="diagonal", rechunk=True)
-		.with_columns(pl.col("codomain").list.sort().list.join("/"))
-		.collect()
-		.pivot("codomain", index=["sample_type", "sample_id"], separator="-")
-		.drop(post_pivot_drop_cols)
+	return read_feature_data(
+		stat_dump_dirs=stat_dump_dirs,
+		index_columns=("sample_type", "sample_id"),
+		row_filter=pl.col("patient_id") == patient_id,
+		labels_include=labels_include,
+		labels_exclude=labels_exclude,
+		column_dtypes=pl.Schema({"sample_type": SAMPLE_TYPES_ENUM}),
 	)
 
 
@@ -321,9 +205,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 		return {}
 
 	# Prediction target
-	y: NDArray1[np.integer] = (
-		data.get_column("sample_type").to_physical().to_numpy()
-	)
+	y: NDArray1[np.integer] = data.get_column("sample_type").to_physical().to_numpy()
 
 	# If the target has only samples of a given type, return an empty dictionary
 	classes, class_counts = np.unique(y, return_counts=True)
@@ -340,7 +222,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	if classification_params.num_permutations < 1:
 		errmsg = "num_permutations must be at least 1."
 		raise ValueError(errmsg)
-	n_splits = classification_params.splitter.get_n_splits(X=data, y=y)
+	n_splits = classification_params.splitter.get_n_splits()
 	if class_counts.min() < n_splits:
 		logging.getLogger(__name__).warning(
 			"Skipping patient: the smallest class has %d samples, fewer than %d CV folds.",
@@ -373,7 +255,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 	cv_baseline_test_scores = np.empty(n_splits, dtype=float)
 	oof_predictions = np.empty(len(y), dtype=float)
 	oof_baseline_predictions = np.empty(len(y), dtype=float)
-	cv_splits = classification_params.splitter.split(data, y)
+	cv_splits = classification_params.splitter.split(data.to_numpy(), y)
 	for fold_index, (train_idxs, test_idxs) in enumerate(
 		tqdm(
 			cv_splits,
@@ -407,7 +289,7 @@ def run_classification_single_patient(  # noqa: C901, PLR0915
 
 		baseline_estimator = cast(
 			"FittedClassifier",
-			DummyClassifier().fit(data_train, y[train_idxs]),
+			DummyClassifier().fit(data_train.to_numpy(), y[train_idxs]),
 		)
 		baseline_predictions = predict_class_probability(
 			baseline_estimator,
@@ -652,7 +534,7 @@ if __name__ == "__main__":
 		return p
 
 	base_path = Path(__file__).parent
-	default_options = {
+	default_options: dict[str, dict[str, Any]] = {
 		"--stats-dirs": {
 			"type": valid_directory,
 			"nargs": "+",

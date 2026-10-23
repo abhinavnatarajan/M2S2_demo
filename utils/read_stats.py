@@ -1,19 +1,43 @@
-"""Functions for reading computed statistics from disk during classification."""
+"""Read persisted statistics and prepare the shared analysis feature table."""
 
-from itertools import product
+from collections.abc import Sequence
 from os import PathLike
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal, overload
 
 import polars as pl
+import polars.selectors as cs
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .stat_schema import DiagramName
+from .persistent_stats import PERS_STATS_NAMES, STATISTIC_NAMES
+from .stat_schema import FeatureParts
 
-__all__ = ["read_stats"]
+__all__ = ["read_feature_data", "read_stats"]
 
-DGM_NAMES_REGEX: str = f"({'|'.join(get_args(DiagramName.__value__))}"
+
+@overload
+def read_stats(
+	stat_dir: PathLike,
+	table_format: Literal["parquet"] = "parquet",
+	**kwargs,
+) -> pq.ParquetDataset: ...
+
+
+@overload
+def read_stats(
+	stat_dir: PathLike,
+	table_format: Literal["pyarrow"],
+	**kwargs,
+) -> pa.Table: ...
+
+
+@overload
+def read_stats(
+	stat_dir: PathLike,
+	table_format: Literal["polars"],
+	**kwargs,
+) -> pl.DataFrame: ...
 
 
 def read_stats(
@@ -21,112 +45,140 @@ def read_stats(
 	table_format: Literal["parquet", "pyarrow", "polars"] = "parquet",
 	**kwargs,
 ) -> pq.ParquetDataset | pa.Table | pl.DataFrame:
-	"""Read the statistics computed by `generate_stats` from a specified directory.
+	"""Read a statistics dataset as a Parquet dataset, Arrow table, or Polars frame.
 
-	This function allows for reading the computed statistics in different formats,
-	supporting "parquet" for raw ParquetDataset objects, "pyarrow" for PyArrow Table objects,
-	and "polars" for Polars DataFrame objects. This flexibility is useful for different downstream
-	analysis tasks which may require specific data formats.
-
-	Parameters
-	----------
-	stat_dir : Pathlike
-			The directory from which to read the computed statistics.
-			This should be the same directory specified
-			as the `output_dir` in `generate_stats`.
-	table_format : (Literal["parquet", "pyarrow", "polars"], optional)
-			The format in which to read the statistics. Defaults to "parquet".
-	**kwargs:
-			Additional keyword arguments to pass to `pyarrow.parquet.ParquetDataset`.
-
-	Returns
-	-------
-	pyarrow.parquet.ParquetDataset | pyarrow.Table | polars.DataFrame:
-			The computed statistics in the specified format.
-			The exact type of the return value depends on the `format` parameter.
-
-	Raises
-	------
-	ValueError:
-			If an invalid format is specified.
-
-	Examples
-	--------
-	```python
-	stats_df = read_stats("/path/to/stats", table_format="polars")
-	print(stats_df.head())
-	```
-
+	Additional keyword arguments are passed to ``pyarrow.parquet.ParquetDataset``.
 	"""
 	if table_format not in ("parquet", "pyarrow", "polars"):
-		raise ValueError("Invalid format specified. Use 'parquet', 'pyarrow', or 'polars'.")
-	stat_path = Path(stat_dir).resolve()
-	dataset = pq.ParquetDataset(stat_path, **kwargs)
+		msg = "Invalid format specified. Use 'parquet', 'pyarrow', or 'polars'."
+		raise ValueError(msg)
+	dataset = pq.ParquetDataset(Path(stat_dir).resolve(), **kwargs)
 	if table_format == "parquet":
 		return dataset
-	dataset = dataset.read()
+	table = dataset.read()
 	if table_format == "pyarrow":
-		return dataset
-	return pl.from_arrow(dataset)
+		return table
+	return pl.DataFrame(table)
+
+
+def _feature_selectors() -> tuple[cs.Selector, cs.Selector, cs.Selector]:
+	"""Select statistics and exclusions before and after the codomain pivot."""
+	diagram = r"(ker|cok|dom|cod|im|rel)"
+	persistent_statistic = rf"({'|'.join(PERS_STATS_NAMES)})"
+	summary_func = rf"({'|'.join(STATISTIC_NAMES)})"
+	dgm_statistics = cs.matches(rf"^{diagram}\d+-{persistent_statistic}$")
+	pre_pivot_drop = (
+		cs.matches(rf"^(cod|rel)\d+-{persistent_statistic}$")
+		| cs.matches(rf"^cok0-{persistent_statistic}$")
+		| cs.matches(rf"^(dom|im)0-{summary_func}_(birth|midpt|length)$")
+		| cs.matches(rf"^{diagram}\d+-iqr")
+	)
+	singles = cs.matches(rf"^{diagram}\d+-{persistent_statistic}-[^/]+$")
+	single_domain = cs.matches(rf"^dom\d+-{persistent_statistic}-[^/]+$")
+	multiple_domain = cs.matches(rf"^dom\d+-{persistent_statistic}-[^/]+/.+$")
+	return dgm_statistics, pre_pivot_drop, (singles - single_domain) | multiple_domain
+
+
+def read_feature_data(
+	*,
+	stat_dump_dirs: Sequence[PathLike],
+	index_columns: Sequence[str],
+	labels_include: tuple[str, ...] = (),
+	labels_exclude: tuple[str, ...] = (),
+	row_filter: pl.Expr | None = None,
+	column_dtypes: pl.Schema | None = None,
+) -> pl.DataFrame:
+	"""Prepare features identically for colorectal classification and ABM clustering.
+
+	Select and filter diagrams before pivoting, filter cell groups, sort their names,
+	and pivot to one row per sample. Metadata remain explicit index columns. Duplicate
+	sample/cell-group rows raise a Polars error rather than silently averaging runs.
+	Missing feature values remain null for the caller's imputation step.
+	"""
+	if not stat_dump_dirs:
+		msg = "At least one statistics directory is required."
+		raise ValueError(msg)
+	if not index_columns:
+		msg = "At least one sample index column is required."
+		raise ValueError(msg)
+	statistics, pre_drop, post_drop = _feature_selectors()
+	frames = []
+	for path in stat_dump_dirs:
+		frame = pl.scan_parquet(
+			Path(path).resolve(),
+			hive_partitioning=True,
+			missing_columns="insert",
+		)
+		if row_filter is not None:
+			frame = frame.filter(row_filter)
+		frame = frame.select(*index_columns, "codomain", statistics - pre_drop).drop_nulls(
+			"codomain",
+		)  # will also drop "filtration_algorithm" and "patient_id"
+		if labels_include:
+			frame = frame.filter(
+				pl.col("codomain").list.set_difference(labels_include).list.len() == 0,
+			)
+		if labels_exclude:
+			frame = frame.filter(
+				pl.col("codomain").list.set_intersection(labels_exclude).list.len() == 0,
+			)
+		if column_dtypes:
+			frame = frame.cast(column_dtypes)
+		frames.append(frame)
+	data = (
+		pl.concat(frames, how="diagonal_relaxed", rechunk=True)
+		.with_columns(pl.col("codomain").list.sort().list.join("/"))
+		.collect()
+		.with_columns(cs.float().fill_nan(None))
+	)
+	feature_columns = [c for c in data.columns if c not in (*index_columns, "codomain")]
+	if not feature_columns:
+		# If there aren't any features then something has gone wrong
+		msg = (
+			"Statistics table has no features. "
+			"This could be either due to `labels_include - labels_exclude` being empty, "
+			"or due to an invalid dataset."
+		)
+		raise RuntimeError(msg)
+	result = data.pivot(
+		on="codomain",
+		index=list(index_columns),
+		values=feature_columns,
+		separator="-",
+	)
+	# Polars omits the value-column prefix for a pivot with just one value column.
+	if len(feature_columns) == 1:
+		result = result.rename(
+			{c: f"{feature_columns[0]}-{c}" for c in result.columns if c not in index_columns},
+		)
+	result = result.drop(post_drop)
+	return result.select(
+		*index_columns,
+		*sorted(c for c in result.columns if c not in index_columns),
+	).sort(index_columns)
 
 
 def stat_name_split(name: str) -> tuple[str, int, str]:
-	"""Split a stat name of the form '<dgm><dim>-<statistic>' into a tuple."""
-	dgm_name_and_dim, statistic = name.split("-")
-	dgm_name, dgm_dim = dgm_name_and_dim[:-1], int(dgm_name_and_dim[-1])
-	return (dgm_name, dgm_dim, statistic)
+	"""Split '<diagram><dimension>-<statistic>'."""
+	parts = FeatureParts(
+		f"{name}-_",  # FeatureParts expects the cell group, so we pass '_' as a dummy
+	)
+	return parts.dgm, parts.dim, parts.statistic
 
 
-
-
+# Legacy - only used for tests and to document the code.
 def discard_feature(feature_name: str) -> bool:
-	"""Filter out unwanted features."""
-	imm_panel_types = (
-		"Epithelium (imm)",
-		"Neutrophil",
-		"Macrophage",
-		"Cytotoxic T Cell",
-		"Treg Cell",
-		"T Helper Cell",
-	)
-	str_panel_types = ("Epithelium (str)", "CD146", "CD34", "Periostin", "SMA", "Podoplanin")
-	cross_pairs = tuple(
-		tuple(sorted(pair)) for pair in product(("Epithelium (imm)",), str_panel_types)
-	) + tuple(tuple(sorted(pair)) for pair in product(("Epithelium (str)",), imm_panel_types))
-	feature_parts = FeatureParts(feature_name)
-	dgm, dim, statistic, cell_group = (
-		feature_parts.dgm,
-		feature_parts.dim,
-		feature_parts.statistic,
-		feature_parts.codomain,
-	)
+	"""Apply the shared feature rules to a fully qualified feature name."""
+	parts = FeatureParts(feature_name)
 	return (
-		dgm in ("cod", "rel")  # discard codomain and relative diagrams
+		parts.dgm in ("cod", "rel")
+		or (parts.dgm == "cok" and parts.dim == 0)
 		or (
-			dim == 0  # dimension 0
-			and dgm == "cok"  # cokernel in dimension 0 is always empty
+			parts.dgm in ("dom", "im")
+			and parts.dim == 0
+			and parts.statistic.rsplit("_", maxsplit=1)[-1] in ("birth", "midpt", "length")
 		)
-		or (
-			dim == 0  # dimension 0
-			and dgm in ("dom", "im")
-			and (any(x in statistic for x in ("birth", "midpt", "length")))
-			# births are always 0 in dom0 and im0
-			# midpts and length not required since we have death
-		)
-		or (
-			"iqr" in statistic  # drop interquartile range since we have p25 and p75
-		)
-		or (
-			# ignore pairs where the cell types are not in the same panel
-			len(cell_group) == 2  # noqa: PLR2004
-			and tuple(sorted(cell_group)) in cross_pairs
-		)
-		or (
-			len(cell_group) == 1  # single cell type
-			and dgm != "dom"  # keep only the domain
-		)
-		or (
-			len(cell_group) > 1  # more than one cell type
-			and dgm == "dom"  # don't need the domain diagrams for pairs or triples
-		)
+		or parts.statistic.startswith("iqr")
+		or ("/" not in parts.codomain and parts.dgm != "dom")
+		or ("/" in parts.codomain and parts.dgm == "dom")
 	)
