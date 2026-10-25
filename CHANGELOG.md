@@ -9,7 +9,7 @@ pipeline and plotting notebooks. The project version is now 0.2.0.
 
 The statistics-generation pipeline now uses chalc 15.0.0 and phimaker 0.5.0.
 The mathematical choice of morphism, the 38 persistence statistics, the persisted
-feature names, and the downstream analysis logic are preserved.
+feature names are preserved. The ABM analysis changes are described below.
 
 No research datasets or figures were generated, overwritten, or converted.
 The untracked `leon_data/` directory was left untouched. No changes were committed.
@@ -21,17 +21,17 @@ The project virtual environment was synchronized to the updated dependency lock.
 | --- | --- |
 | `pyproject.toml` | Require `chalc~=15.0`, set version 0.2.0, and remove pandas. Polars was already a direct dependency. |
 | `utils/generate_stats.py` | Import morphisms from `chalc.morphisms`; replace `KChromaticQuotient` with `KChromaticGluing`; consume `(name, module)` pairs from six-pack iteration; extract barcodes with `module.intervals(degree)`. |
-| `utils/stat_schema.py` | Define the pipeline's stable `DiagramName` type and the mapping from chalc's full module names to existing statistic prefixes. |
-| `utils/read_stats.py` | Import the stable pipeline `DiagramName` and return Polars frames with `table_format="polars"`. The Parquet and PyArrow modes retain their behavior. |
-| `colorectal_cancer_dataset_analysis/classification_by_patient_pca.py` | Make the same type-import substitution; feature parsing, filtering, PCA, classifiers, and scoring are otherwise unchanged. |
+| `utils/stat_schema.py` | Define stable diagram names, the chalc module-name mapping, and the shared `FeatureParts` parser. |
+| `utils/read_stats.py` | Read Parquet/Arrow/Polars tables and provide the shared feature selection and pivot used by both analyses. |
+| `colorectal_cancer_dataset_analysis/classification_by_patient_pca.py` | Delegate feature parsing and reading to shared helpers, including the corrected IQR selector. PCA, classifiers, and scoring are unchanged. |
 | `tests/test_chalc15.py` | Add five small synthetic tests covering numerical extraction, degree limits, persistence edge cases, categorical dtypes, Parquet compatibility, and CSV generation/resume. |
-| `tests/test_polars_migration.py` | Add seven synthetic tests for readers, existing Arrow partitions and resume, ABM dataframe transformations, plotting inputs, legacy HDF5, and notebook helper functions. |
+| `tests/test_polars_migration.py` | Check Arrow partitions/resume, ABM metadata transformations, plotting inputs, and the retained ABM notebook helper. |
+| `tests/test_eee_clustering.py` | Add thirteen synthetic checks for shared filtering, no-PCA KMeans, deterministic grouped importance for three partition scores, label isolation, and output handling. |
 | `utils/parallel.py` | Use spawned worker processes and a module-level initializer, avoiding inherited Polars thread locks. |
 | `utils/plotting.py` | Use Polars filtering and columns for the weighted violin plot. |
 | `abm_dataset_analysis/generate_stats.py` | Use Polars for CSV loading, metadata joins, and macrophage labels. |
-| `abm_dataset_analysis/eee_clustering.py` | Replace index/tuple-column dataframes with Polars frames and explicit metadata columns, preserving the analysis formulas and clustering settings. |
+| `abm_dataset_analysis/eee_clustering.py` | Remove PCA; use zero imputation, optional standardization, and seeded KMeans. Add ARI, NMI, and Binder-loss evaluation against EEE annotations and importance per cell group/diagram/dimension. |
 | Plotting notebooks | Convert dataframe operations to Polars; preserve all saved outputs and execution counts. |
-| `utils/legacy_results.py` | Read the original fixed-format HDF5 result tables directly with PyTables into Polars, without rewriting the archive. |
 
 Singles and pairs still use `KChromaticInclusion(filt, 1)`. Triples and larger
 combinations use `KChromaticGluing(filt, number_of_labels - 1)`, the renamed
@@ -92,15 +92,97 @@ metadata are ordinary columns and are explicitly excluded from numeric model
 inputs. Feature names use `<statistic>-<cell/group>` strings in memory instead
 of tuple labels; persisted statistics retain their established schema.
 
+The colorectal cross-validation splitter and `DummyClassifier.fit` now receive
+NumPy arrays explicitly, matching scikit-learn's type annotations. The grouped
+PCA pipeline still receives Polars frames to retain feature names and grouping.
+`get_n_splits()` is called without its unused data arguments. Format-specific
+`read_stats` overloads expose the correct Parquet, Arrow, or Polars return type
+to type checkers without changing runtime behavior.
+
 Worker processes now use `spawn`, following the
 [Polars multiprocessing guidance](https://docs.pola.rs/user-guide/misc/multiprocessing/).
 Call multiprocessing entry points from a script protected by
 `if __name__ == "__main__":`; worker initializers must be pickleable.
 
-The old plotting notebooks retain their historical input paths and analysis
+The retained ABM plotting notebooks keep their historical input paths and analysis
 choices. Their code cells were converted without executing them or updating any
-stored figures. The legacy HDF5 reader supports numeric fixed-format result
-frames with ordinary or MultiIndex rows; other HDF5 layouts are outside its scope.
+stored figures. Historical PCA comparisons in those notebooks have not been
+regenerated for the refurbished clustering pipeline.
+
+### ABM clustering refurbishment
+
+Both analyses now call `read_feature_data` for the same lazy Parquet scan,
+cell-group filtering, diagram/statistic filtering, canonical cell-group naming,
+and pivot. `FeatureParts` lives in `utils/stat_schema.py`. The colorectal module
+continues to expose its imported `FeatureParts` name for existing callers.
+Metadata remain separate from model features. Duplicate sample/cell-group rows
+are rejected, matching colorectal pivot behavior, rather than averaged silently.
+
+The common filters discard codomain/relative diagrams, cokernel degree zero,
+redundant domain/image degree-zero birth/midpoint/length summaries, IQR, non-domain
+single-cell diagrams, and domain diagrams for multiple cell types. The previous
+colorectal IQR regex ended in `-iqr$`, which did not select names such as
+`ker1-iqr_birth`. The shared selector now uses the prefix `...-iqr` without an
+end anchor, covering current and future IQR suffixes. This changes the colorectal
+feature set to apply its documented IQR rule.
+
+ABM PCA code and its three CLI flags have been removed. The model is now
+constant-zero imputation, per-feature standardization, and KMeans. Scaling can
+be disabled with `--no-standardize`; there is no dimension reduction. KMeans
+uses 20 initializations and an explicit `--clustering-seed` (default 0).
+
+EEE annotations are excluded from fitting and used only for ARI, NMI, and Binder
+loss evaluation on individual simulation samples. NMI explicitly uses the
+arithmetic entropy normalizer. Binder loss uses equal split/merge weights and is
+normalized by the number of unordered sample pairs: the fraction of pairs whose
+co-clustering status differs, equivalently `1 - Rand index`. Zero Binder loss is
+best; it is not adjusted for chance.
+
+For each `(cell group, diagram, dimension)`, all retained statistic columns are
+shuffled together using one row permutation. The imputer, scaler, and KMeans
+remain fitted and fixed. ARI and NMI importance use `baseline - permuted`;
+Binder importance uses `permuted_loss - baseline_loss`. Thus positive importance
+means permutation worsens agreement for all metrics; negative values are retained.
+All groups and metrics share the same pre-generated permutations, controlled by
+`--permutations-seed`. Each permutation makes one prediction call, and all three
+scores use those predictions. `--num-permutations` defaults to 100.
+
+The JSON result retains `labels` and parameter-pair `results`, and adds sample
+IDs, `final_model_scores` keyed by `ari`, `nmi`, and `binder_loss`, preprocessing
+and metric conventions, and a `feature_importances` list. Each entry identifies
+the cell group, diagram, dimension, and column names. Its `importances`, `mean`,
+and `std` mappings contain entries for all three metrics. The CLI refuses to
+overwrite an existing result file. The former interim singular
+`final_model_score`/`score_name` fields are replaced by `final_model_scores`.
+
+Example command (not executed on research data during this work):
+
+```bash
+uv run python -m abm_dataset_analysis.eee_clustering \
+    --stats-dir abm_dataset_analysis/stats \
+    --output-file abm_dataset_analysis/results/eee_ari_importance_v2.json \
+    --k 3 --num-permutations 100
+```
+
+These are final-model reliance measures on the observed data, as in the
+colorectal final-model importance calculation. They are not held-out predictive
+performance or causal effects. Correlated groups can mask each other, and groups
+with different numbers of statistics are different-sized perturbations.
+
+Alternative scores all require a reference partition unless they are internal
+geometry criteria:
+
+| Score | Interpretation and tradeoff |
+| --- | --- |
+| ARI (implemented) | Pairwise agreement adjusted for chance; invariant to cluster-label numbering. |
+| NMI (implemented) | Normalized shared information; not adjusted for chance. AMI is the chance-adjusted alternative. |
+| Variation of information | Conditional-entropy loss measuring splits and merges; zero is best. Loss importance uses `permuted_loss - baseline_loss`. |
+| Binder loss (implemented) | Equal split/merge weights, normalized by the number of pairs: `1 - Rand index`. Asymmetric penalties are not implemented. |
+| Negative inertia | No reference labels needed; evaluates distances to the fixed fitted centers, with dependence on units/scaling. |
+
+See [scikit-learn clustering evaluation](https://scikit-learn.org/stable/modules/clustering.html#clustering-performance-evaluation),
+[permutation importance](https://scikit-learn.org/stable/modules/permutation_importance.html),
+and [Wade and Ghahramani on Binder and VI losses](https://arxiv.org/abs/1505.03339).
 
 ### Dependency locks
 
@@ -155,18 +237,44 @@ kept outside research-data and figure directories.
    `uv lock --check --offline` passed. Both dataset statistics-generator modules
    and the colorectal classification module imported successfully.
 6. **Polars compatibility.** Checked dictionary-encoded legacy Arrow partitions
-   and resume matching; ABM metadata joins and macrophage splitting; duplicate
-   pivot aggregation and missing values; explicit exclusion of metadata from
-   model inputs; and the existing PCA formula. Model handoff and result grouping
-   were checked with fixed labels, without running a clustering job.
+   and resume matching; ABM metadata joins and macrophage splitting; explicit
+   exclusion of metadata from model inputs; and the revised shared pivot/filtering.
 7. **Notebook and archive checks.** All notebook code cells parse, and all saved
    outputs and execution counts match the original notebooks. Small helper
    functions were exercised on synthetic frames without executing figure-writing
-   cells. The legacy reader passed numeric-block and MultiIndex checks; the
-   test archive's bytes were unchanged. Pandas is absent from the installed
-   environment and both lockfiles.
+   cells. Pandas is absent from the installed environment and both lockfiles.
 
-All twelve reusable tests passed:
+The ABM-specific tests exercise only eight-sample synthetic datasets. They check
+identical ABM/colorectal feature tables, joint permutations including missingness,
+correct grouping, reproducibility, annotation isolation, and retained negative
+importances for all three metrics. A hand-counted six-pair example verifies Binder
+normalization. Prediction-call counts verify that adding metrics does not add
+prediction passes. A synthetic future IQR statistic verifies prefix filtering.
+The project passes Pyrefly and the affected modules pass targeted fatal-error lint checks.
+The user corrected the numeric type guard in `weighted_violinplot`; the plotting
+regression test is included in the full suite.
+
+Final validation: all 22 regression tests passed, including 13 ABM checks and the
+plotting test. Full-project Pyrefly checking includes the notebooks and tests and
+reports zero errors with versions 1.2.0 and 1.4.0, with two scoped suppressions
+(the existing plotting scalar overload and the scikit-learn import described
+below). Version 1.2.0 retains two existing warnings about redundant `float()`
+calls in the colorectal visualization scripts; version 1.4.0 instead reports
+two warnings about missing SciPy type stubs in the PCA and plotting helpers.
+The earlier four-module check missed diagnostics elsewhere: predictions are now
+explicitly converted to NumPy before JSON serialization, test unions are narrowed,
+notebook label alignment rejects unsupported cluster counts, and tick labels are
+explicitly strings. The existing colorectal PCA helper now qualifies its nested
+`GroupModel` annotation. Its `validate_data` import has a narrowly scoped,
+documented suppression because Pyrefly's bundled scikit-learn stubs omit this
+public API; the installed scikit-learn implementation was checked directly.
+A separate 12-sample colorectal check with two cross-validation folds and two
+permutations compared the previous dataframe calls against the explicit NumPy
+calls. Every result field was exactly unchanged, including cross-validation
+scores, baseline scores, final scores, and grouped importance arrays.
+Only tiny synthetic datasets were used.
+
+Run the tests with:
 
 ```bash
 uv run python -m unittest discover -s tests -v
@@ -178,20 +286,14 @@ the suite passed when run with permission to use local IPC.
 
 ### Limits and existing issues
 
-The full research pipeline, classifiers, clustering jobs, and figure notebooks
-were not executed. Agreement on tiny synthetic examples is not a proof of
+The full research pipeline and figure notebooks were not executed. Classifier
+and clustering runs used only tiny synthetic inputs. Agreement on these is not a proof of
 numerical identity on every dataset: chalc 15 also includes upstream persistence
 bug fixes. Existing resume behavior is unchanged, including its lack of
 dependency-version tracking for stored rows. Use a separate output directory
 when comparing newly generated v15 results with archived paper results.
 
-A targeted lint check also found a pre-existing undefined `FeatureParts`
-reference in `utils/read_stats.py::discard_feature`. That function was not
-modified by this migration. The classification script's own `FeatureParts`
-implementation imports and parses the generated names successfully.
-
-The ABM dataframe conversion removes the old dependency on the absent
-`normalize_colname` helper: feature names are ordinary strings and metadata
-columns are kept explicitly. Broader unfinished ABM analysis work remains
-deferred. The PCA formula, feature-selection conditions, and KMeans parameters
-were retained rather than revised as part of the dataframe conversion.
+The previously undefined `FeatureParts` reference in `utils/read_stats.py` is
+resolved by using the shared parser. The retired ABM `normalize_colname` import
+is no longer needed. The PCA-preservation and removed legacy-notebook tests
+have been replaced with checks of the current pipeline and retained files.
