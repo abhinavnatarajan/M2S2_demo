@@ -1,9 +1,11 @@
 figures/
 abm_dataset_analysis/data/simulation_samples/**
 abm_dataset_analysis/stats
+abm_dataset_analysis/results
 abm_dataset_analysis/logs
 colorectal_cancer_dataset_analysis/data
 colorectal_cancer_dataset_analysis/stats
+colorectal_cancer_dataset_analysis/results
 colorectal_cancer_dataset_analysis/logs
 *.png
 **/.ipynb_checkpoints
