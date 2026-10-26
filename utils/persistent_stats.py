@@ -3,7 +3,6 @@
 from typing import Literal, Self
 
 import numpy as np
-from gudhi.representations.preprocessing import BirthPersistenceTransform, DiagramScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import MinMaxScaler
 
@@ -11,6 +10,157 @@ type NumpyVector[T: np.generic] = np.ndarray[tuple[int], np.dtype[T]]
 type Barcode = np.ndarray[tuple[int, Literal[2]], np.dtype[np.float64]]
 
 __all__ = ["PERS_STATS_NAMES", "get_pers_stats"]
+
+
+#############################################
+# Preprocessing #############################
+#############################################
+
+
+# Taken from Gudhi
+class BirthPersistenceTransform(BaseEstimator, TransformerMixin):
+	"""Affine transformation (x,y) -> (x,y-x) to be applied on persistence diagrams."""
+
+	def __init__(self) -> None:
+		"""Initialize the class with defaults."""
+
+	# type: ignore[unused-parameter]
+	# ruff: ignore[ARG002,N803]
+	def fit(self, X: list[Barcode], y: list[str] | None = None) -> Self:
+		"""Fit the BirthPersistenceTransform class on a list of persistence diagrams.
+
+		This function actually does nothing but is useful when BirthPersistenceTransform
+		is included in a scikit-learn Pipeline.
+
+		Parameters:
+			X (list of n x 2 numpy array): input persistence diagrams.
+			y (n x 1 array): persistence diagram labels (unused).
+		"""
+		return self
+
+	# ruff: ignore[N803]
+	def transform(self, X: list[Barcode]) -> list[Barcode]:
+		"""Apply the BirthPersistenceTransform on a list of persistence diagrams.
+
+		Parameters:
+			X (list of n x 2 numpy array): input persistence diagrams.
+
+		Returns:
+			list of n x 2 numpy array: transformed persistence diagrams.
+		"""
+		x_fit = []
+		for diag in X:
+			# new_diag = np.empty(diag.shape)
+			# np.copyto(new_diag, diag)
+			new_diag = np.copy(diag)
+			new_diag[:, 1] = new_diag[:, 1] - new_diag[:, 0]
+			x_fit.append(new_diag)
+		return x_fit
+
+	def __call__(self, diag: Barcode) -> Barcode:
+		"""
+		Apply BirthPersistenceTransform on a single persistence diagram.
+
+		Parameters:
+			diag (n x 2 numpy array): input persistence diagram.
+
+		Returns:
+			n x 2 numpy array: transformed persistence diagram.
+		"""
+		return self.transform([diag])[0]
+
+
+# Taken from Gudhi
+class DiagramScaler(BaseEstimator, TransformerMixin):
+	"""Preprocess persistence diagrams with a given list of scalers."""
+
+	def __init__(self, *, use: bool = False, scalers: list | None = None) -> None:
+		"""Construct the DiagramScaler class.
+
+		Parameters:
+			use (bool): whether to use the class or not (default False).
+			scalers (list of classes): list of scalers to be fit on the persistence diagrams
+				(default []).
+				Each element of the list is a tuple with two elements:
+				the first one is a list of coordinates, and the second one is a scaler
+				(i.e. a class with fit() and transform() methods) that is going to be
+				applied to these coordinates. Common scalers can be found in the
+				scikit-learn library (such as MinMaxScaler for instance).
+		"""
+		if scalers is None:
+			scalers = []
+		self.scalers = scalers
+		self.use = use
+
+	# type: ignore[unused-parameter]
+	# ruff: ignore[ARG002,N803]
+	def fit(self, X: list[Barcode], y: list[str] | None = None) -> Self:
+		"""Fit the DiagramScaler class on a list of persistence diagrams.
+
+		Persistence diagrams are concatenated in a big numpy array,
+		and scalers are fit (by calling their fit() method) on their
+		corresponding coordinates in this big array.
+
+		Parameters:
+			X (list of n x 2 or n x 1 numpy arrays): input persistence diagrams.
+			y (n x 1 array): persistence diagram labels (unused).
+		"""
+		self.is_fitted_ = True
+		if self.use:
+			p = np.concatenate(X, axis=0)
+			for indices, scaler in self.scalers:
+				scaler.fit(np.reshape(p[:, indices], [-1, 1]))
+		return self
+
+	# ruff: ignore[N803]
+	def transform(self, X: list[Barcode]) -> list[Barcode]:
+		"""Apply the DiagramScaler function on the persistence diagrams.
+
+		The fitted scalers are applied (by calling their transform() method)
+		to their corresponding coordinates in each persistence diagram individually.
+
+		Parameters:
+			X (list of n x 2 or n x 1 numpy arrays): input persistence diagrams.
+
+		Returns:
+			list of n x 2 or n x 1 numpy arrays: transformed persistence diagrams.
+		"""
+		x_fit = [np.copy(d) for d in X]
+		if self.use:
+			for diag_index in range(len(x_fit)):
+				if x_fit[diag_index].shape[0] > 0:
+					for indices, scaler in self.scalers:
+						for i in indices:
+							x_fit[diag_index][:, i] = np.squeeze(
+								scaler.transform(np.reshape(x_fit[diag_index][:, i], [-1, 1])),
+							)
+		return x_fit
+
+	def __call__(self, diag: Barcode) -> Barcode:
+		"""Apply DiagramScaler on a single persistence diagram.
+
+		If :func:`fit` hasn't been run, this uses `fit_transform` on
+		a clone of the object and thus does not affect later calls.
+
+		Parameters:
+			diag (n x 2 numpy array): input persistence diagram.
+
+		Returns:
+			n x 2 numpy array: transformed persistence diagram.
+		"""
+		return self._maybe_fit_transform(diag)
+
+	def _maybe_fit_transform(self, diag: Barcode) -> Barcode:
+		"""Transform data without affecting internal state.
+
+		In __call__, use transform on the object itself if it has been fitted,
+		otherwise fit_transform on a clone of the object so it doesn't affect future calls.
+		"""
+		if hasattr(self, "is_fitted_"):
+			result = self.transform([diag])
+		else:
+			result = self.__class__(**self.get_params()).fit([diag]).transform([diag])
+		return result[0]
 
 
 def _bar_cleaner(barcode: Barcode) -> Barcode:
@@ -24,7 +174,7 @@ def _bar_cleaner(barcode: Barcode) -> Barcode:
 def _automatic_sample_range(
 	sample_range: tuple[float, float],
 	X: list[Barcode],
-	y: None = None,
+	y: list[str] | None = None,
 ) -> tuple[float, float]:
 	"""Compute sample range from persistence diagrams if one of the sample_range values is nan.
 
@@ -122,7 +272,7 @@ class Entropy(BaseEstimator, TransformerMixin):
 		return self
 
 	# ruff: ignore[N803]
-	def transform(self, X: list[Barcode]) -> NumpyVector[np.floating]:
+	def transform(self, X: list[Barcode]) -> np.ndarray[tuple[int, int], np.dtype[np.number]]:
 		"""Compute the entropy for each persistence diagram and concatenate the results.
 
 		Parameters
@@ -132,17 +282,19 @@ class Entropy(BaseEstimator, TransformerMixin):
 
 		Returns
 		-------
-			numpy array with shape (number of diagrams) x (1 if **mode** = "scalar" else **resolution**): output entropy.
+			numpy array:
+				Output entropy. Has shape
+				(number of diagrams) x (1 if **mode** = "scalar" else **resolution**).
 		"""
 		num_diag, x_fit = len(X), []
 		x_values = np.linspace(self.sample_range[0], self.sample_range[1], self.resolution)
 		step_x = x_values[1] - x_values[0]
-		new_x = BirthPersistenceTransform().fit_transform(X)
+		new_x = BirthPersistenceTransform().fit(X).transform(X)
 
 		for i in range(num_diag):
 			orig_diagram, diagram, num_pts_in_diag = X[i], new_x[i], X[i].shape[0]
 			try:
-				new_diagram = DiagramScaler().fit_transform([diagram])[0]
+				new_diagram = DiagramScaler().fit([diagram]).transform([diagram])[0]
 			except ValueError:
 				# Empty persistence diagram case - https://github.com/GUDHI/gudhi-devel/issues/507
 				assert len(diagram) == 0
@@ -182,7 +334,7 @@ class Entropy(BaseEstimator, TransformerMixin):
 
 		return np.concatenate(x_fit, axis=0)
 
-	def __call__(self, diag: Barcode) -> NumpyVector[np.floating]:
+	def __call__(self, diag: Barcode) -> NumpyVector[np.number]:
 		"""Apply Entropy on a single persistence diagram and outputs the result.
 
 		Parameters
@@ -194,7 +346,7 @@ class Entropy(BaseEstimator, TransformerMixin):
 		-------
 			numpy array with shape (1 if **mode** = "scalar" else **resolution**): output entropy.
 		"""
-		return self.fit_transform([diag])[0, :]
+		return self.fit([diag]).transform([diag])[0, :]
 
 
 # Average of Birth and Death of the barcode
