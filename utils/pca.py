@@ -329,7 +329,7 @@ class GroupwisePCA(BaseEstimator):
 	def get_feature_names_out(
 		self,
 		# ruff: ignore[ARG002]
-		input_features: Sequence[str] | None = None, # type: ignore[unused-parameter]
+		input_features: Sequence[str] | None = None,  # type: ignore[unused-parameter]
 	) -> np.ndarray:
 		"""Return names for the transformed PCA features.
 

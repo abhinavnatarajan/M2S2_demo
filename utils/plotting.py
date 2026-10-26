@@ -43,9 +43,7 @@ def weighted_violinplot(
 		data = dataset.filter(pl.col(group_by) == group)
 		kde = gaussian_kde(data[value], weights=data[weight])
 		value_col = data.get_column(value)
-		if not (
-			isinstance(value_col.dtype, (pl.datatypes.IntegerType, pl.datatypes.FloatType))
-		):
+		if not (isinstance(value_col.dtype, (pl.datatypes.IntegerType, pl.datatypes.FloatType))):
 			raise TypeError
 		# pyrefly: ignore [no-matching-overload]
 		coords = np.linspace(value_col.min(), value_col.max(), 1000)
