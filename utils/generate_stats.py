@@ -66,58 +66,58 @@ def generate_stats(
 	Parameters
 	----------
 	cmdline_args: argparse.Namespace
-	    A namespace or an object with the following attributes:
-	    - dataset_dir (str): The directory containing the datasets.
-	        Each dataset should be a CSV file.
-	    - files_list (list | None): A list of file paths to process,
-	        which must be relative to the dataset_dir.
-	        If None, all files in the dataset_dir will be processed.
-	    - output_dir (str): The directory where the computed statistics will be
-	        saved as an Apache Parquet dataset.
-	    - resume (bool): If True, existing statistics will be not be recomputed.
-	        If False, existing statistics will be recomputed and overwritten.
-	    - x_column (str): The name of the column in the CSV files
-	        that contains the x coordinates of the points.
-	    - y_column (str): The name of the column in the CSV files
-	        that contains the y coordinates of the points.
-	    - label_column (str): The name of the column in the CSV files
-	        that contains the labels of the points.
-	    - labels_include (list[str]) : The labels to include in the analysis.
-	    - labels_exclude (list[str]) : The labels to exclude in the analysis.
-	    - max_num_labels (int): The maximum number of labels to consider per combination.
-	    - min_num_labels (int): The minimum number of labels to consider per combination.
-	    - max_diagram_dimension (int): The maximum dimension of
-	        the persistence diagrams to compute.
-	    - filtration_algorithm (str): The method used for computing
-	        the chromatic Delaunay filtration.
-	    - min_count (int): The minimum number of points required
-	        for a label to be included in the analysis.
-	    - num_workers (int): The number of worker processes to use
-	        for parallel computation.
-	    - verbosity (int): The logging verbosity level.
-	    - logfile_dir (str): The directory where the log file will be saved.
-	    - disable_progressbar (bool): If True, the progress bar will be disabled.
-	    - test_run (bool): If True, the function will run in test mode,
-	        processing only a small number of files with a reduced number of workers.
-	    - dry_run (bool): If True, the function will not compute any statistics.
-	        Only the list of files to be processed will be output to the logs.
+		A namespace or an object with the following attributes:
+		- dataset_dir (str): The directory containing the datasets.
+			Each dataset should be a CSV file.
+		- files_list (list | None): A list of file paths to process,
+			which must be relative to the dataset_dir.
+			If None, all files in the dataset_dir will be processed.
+		- output_dir (str): The directory where the computed statistics will be
+			saved as an Apache Parquet dataset.
+		- resume (bool): If True, existing statistics will be not be recomputed.
+			If False, existing statistics will be recomputed and overwritten.
+		- x_column (str): The name of the column in the CSV files
+			that contains the x coordinates of the points.
+		- y_column (str): The name of the column in the CSV files
+			that contains the y coordinates of the points.
+		- label_column (str): The name of the column in the CSV files
+			that contains the labels of the points.
+		- labels_include (list[str]) : The labels to include in the analysis.
+		- labels_exclude (list[str]) : The labels to exclude in the analysis.
+		- max_num_labels (int): The maximum number of labels to consider per combination.
+		- min_num_labels (int): The minimum number of labels to consider per combination.
+		- max_diagram_dimension (int): The maximum dimension of
+			the persistence diagrams to compute.
+		- filtration_algorithm (str): The method used for computing
+			the chromatic Delaunay filtration.
+		- min_count (int): The minimum number of points required
+			for a label to be included in the analysis.
+		- num_workers (int): The number of worker processes to use
+			for parallel computation.
+		- verbosity (int): The logging verbosity level.
+		- logfile_dir (str): The directory where the log file will be saved.
+		- disable_progressbar (bool): If True, the progress bar will be disabled.
+		- test_run (bool): If True, the function will run in test mode,
+			processing only a small number of files with a reduced number of workers.
+		- dry_run (bool): If True, the function will not compute any statistics.
+			Only the list of files to be processed will be output to the logs.
 	filename_index_map : Mapping[str, dict[str,Any]]
-	    A mapping that takes a filename (without path or filetype suffix)
-	    to a dictionary of metadata describing the dataset in the file.
-	    The metadata must be unique between files, as it used for indexing.
-	    This dictionary will be added to the corresponding row in the output dataset.
+		A mapping that takes a filename (without path or filetype suffix)
+		to a dictionary of metadata describing the dataset in the file.
+		The metadata must be unique between files, as it used for indexing.
+		This dictionary will be added to the corresponding row in the output dataset.
 	data_loader : Callable[[Path, dict[str, Any]], tuple[pl.DataFrame, dict[str,Any]]], optional
-	    A function that takes a file path and the index dictionary,
-	    and returns a DataFrame and a dictionary of metadata.
-	    The metadata dictionary can be used to add additional information to the stored statistics.
-	    Used to load the data from the CSV files (and to pre-process the dataframe if needed).
-	    By default, it reads the CSV file into a DataFrame and returns an empty metadata dictionary.
+		A function that takes a file path and the index dictionary,
+		and returns a DataFrame and a dictionary of metadata.
+		The metadata dictionary can be used to add additional information to the stored statistics.
+		Used to load the data from the CSV files (and to pre-process the dataframe if needed).
+		By default, it reads the CSV file into a DataFrame and returns an empty metadata dictionary.
 
 	Returns
 	-------
 	None:
-	    The function saves the computed statistics to an Apache Parquet dataset
-	    in the directory specified by `output_dir`.
+		The function saves the computed statistics to an Apache Parquet dataset
+		in the directory specified by `output_dir`.
 
 	"""
 	num_workers: int = cmdline_args.num_workers
@@ -176,11 +176,11 @@ def generate_stats(
 		):
 			results = process_file(
 				filepath,
-				filename_index_map,
-				data_loader,
-				cmdline_args,
-				parallel,
-				logger,
+				filename_index_map=filename_index_map,
+				data_loader=data_loader,
+				cmdline_args=cmdline_args,
+				par_pool=parallel,
+				logger=logger,
 			)
 			results_df = pl.DataFrame(results, infer_schema_length=None)
 			index_in_df = filename_index_map[filepath.stem]
@@ -207,6 +207,7 @@ def generate_stats(
 
 def process_file(
 	filepath: Path,
+	*,
 	filename_index_map: Mapping[str, dict],
 	data_loader: Callable[[Path, dict[str, Any]], tuple[pl.DataFrame, dict]],
 	cmdline_args: argparse.Namespace,
@@ -281,11 +282,11 @@ def process_file(
 	func = partial(
 		get_stats_k_chromatic_quotient,
 		data_df,
-		x_col,
-		y_col,
-		label_col,
-		filtration_algorithm,
-		max_diagram_dimension,
+		x_col=x_col,
+		y_col=y_col,
+		label_col=label_col,
+		filtration_algorithm=filtration_algorithm,
+		max_diagram_dimension=max_diagram_dimension,
 	)
 	gather = list(
 		tqdm(
@@ -504,15 +505,15 @@ def deep_merge_dicts(base_dict: dict, override_dict: dict) -> dict:
 	Parameters
 	----------
 	base_dict : dict
-	    The base dictionary to merge into.
+		The base dictionary to merge into.
 	override_dict : dict
-	    The dictionary whose values will override base_dict values.
+		The dictionary whose values will override base_dict values.
 
 	Returns
 	-------
 	dict
-	    A new dictionary with values from both dictionaries, with override_dict
-	    values taking precedence when keys conflict.
+		A new dictionary with values from both dictionaries, with override_dict
+		values taking precedence when keys conflict.
 
 	"""
 	result = deepcopy(base_dict)
@@ -546,10 +547,10 @@ def make_filename_index_map(
 			"""Convert filename to metadata dictionary with memoization.
 
 			Args:
-			    filename: File name to transform
+				filename: File name to transform
 
 			Returns:
-			    A dictionary of indexing/unique metadata about the file.
+				A dictionary of indexing/unique metadata about the file.
 
 			"""
 			if filename not in self._cache:
@@ -567,6 +568,7 @@ def make_filename_index_map(
 
 def get_stats_k_chromatic_quotient(
 	df: pl.DataFrame,
+	*,
 	x_col: str,
 	y_col: str,
 	label_col: str,

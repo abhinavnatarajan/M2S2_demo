@@ -36,13 +36,13 @@ def configure_logger(
 	"""Configure a logger with a file and console handler.
 
 	Args:
-	        logger: The logger to configure.
-	        filename: The file to log to. If set to os.devnull,
-	        the file handler will be a NullHandler.
-	        file_level: The log level for the file handler.
-	        console_level: The log level for the console handler.
-	        console_ignore: A logger name or collection of logger names
-	        to ignore when logging to the console.
+			logger: The logger to configure.
+			filename: The file to log to. If set to os.devnull,
+			the file handler will be a NullHandler.
+			file_level: The log level for the file handler.
+			console_level: The log level for the console handler.
+			console_ignore: A logger name or collection of logger names
+			to ignore when logging to the console.
 
 	"""
 	captureWarnings(capture=True)
@@ -212,7 +212,8 @@ class LogParser:
 
 		return report
 
-	def print_report(self, report: dict, only_failed: bool = True) -> None:
+	# ruff: disable[T201]
+	def print_report(self, report: dict, *, only_failed: bool = True) -> None:
 		"""Print a formatted report."""
 		print("=" * 80)
 		print("LOG ANALYSIS REPORT")
@@ -250,3 +251,5 @@ class LogParser:
 				print("  Failed combinations:")
 				for combo in data["combinations"]["failed_combinations"]:
 					print(f"    {combo}")
+
+	# ruff: enable[T201]

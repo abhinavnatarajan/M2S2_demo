@@ -28,7 +28,7 @@ def download_file(
 			if total:
 				size = float(total)
 				for unit in ("B", "KB", "MB", "GB", "TB"):
-					if size < 1e3:
+					if size < 1e3:  # noqa: PLR2004
 						logger.info("File size: %.2f %s", size, unit)
 						break
 					size /= 1e3
