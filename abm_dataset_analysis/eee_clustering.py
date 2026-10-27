@@ -147,6 +147,7 @@ def get_permutation_importance_scores(
 		}
 		for index, permutation in tqdm(
 			enumerate(permutations),
+			total=len(permutations),
 			disable=disable_progressbar,
 			desc="Permutation",
 			leave=False,
