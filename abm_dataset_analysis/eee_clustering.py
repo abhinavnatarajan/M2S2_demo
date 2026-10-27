@@ -145,7 +145,12 @@ def get_permutation_importance_scores(
 		differences = {
 			metric: np.empty(num_permutations, dtype=float) for metric in SCORE_DIRECTIONS
 		}
-		for index, permutation in enumerate(permutations):
+		for index, permutation in tqdm(
+			enumerate(permutations),
+			disable=disable_progressbar,
+			desc="Permutation",
+			leave=False,
+		):
 			# with_columns replaces nulls too; update() would retain the original
 			# values at rows whose permuted replacement is null.
 			permuted = data.with_columns(data.select(columns).gather(permutation).get_columns())
@@ -330,9 +335,19 @@ def make_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--labels-include", nargs="*", choices=cell_types, default=[])
 	parser.add_argument("--labels-exclude", nargs="*", choices=cell_types, default=[])
-	parser.add_argument("--k", type=int, default=3)
-	parser.add_argument("--num-permutations", type=int, default=100)
-	parser.add_argument("--permutations-seed", type=int, default=0)
+	parser.add_argument("--k", help="Number of clusters to find", type=int, default=3)
+	parser.add_argument(
+		"--num-permutations",
+		help="Number of permutations for feature importance",
+		type=int,
+		default=25,
+	)
+	parser.add_argument(
+		"--permutations-seed",
+		help="Seed for generating the permutations for feature importances",
+		type=int,
+		default=0,
+	)
 	parser.add_argument("--clustering-seed", type=int, default=0)
 	parser.add_argument(
 		"--standardize",
