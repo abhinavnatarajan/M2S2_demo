@@ -15,7 +15,7 @@ with app.setup(hide_code=True):
 @app.cell(hide_code=True)
 def _():
 	classification_pairs_df = pl.read_parquet(
-		"./colorectal_cancer_dataset_analysis/results/classification_pairs_v2/**/*.parquet",
+		"./colorectal_cancer_dataset_analysis/results/classification_pairs/**/*.parquet",
 		hive_partitioning=True,
 	).select(
 		"patient_id",
@@ -392,9 +392,8 @@ def _(cell_group_importance_by_patient_df, classification_pairs_df):
 			},
 		}
 	)
-	_pca_scatter_data = patient_pca_scores_df.to_dict(as_series=False)
 	patient_pca_scatter = px.scatter_3d(
-		_pca_scatter_data,
+		data_frame=patient_pca_scores_df,
 		x="PCA1",
 		y="PCA2",
 		z="PCA3",

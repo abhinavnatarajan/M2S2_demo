@@ -1,5 +1,5 @@
 #! /usr/bin/env python
-"""Cluster ABM spatial signatures and measure grouped reliance using EEE annotations."""
+"""Cluster ABM spatial signatures and score grouped permutation refits against EEE labels."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import numpy as np
 import polars as pl
+from sklearn.base import clone
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, rand_score
@@ -23,7 +24,7 @@ from utils.read_stats import read_feature_data
 from utils.stat_schema import DiagramName, FeatureParts
 
 if TYPE_CHECKING:
-	from collections.abc import Mapping, Sequence
+	from collections.abc import Callable, Mapping, Sequence
 	from os import PathLike
 
 	from numpy.typing import ArrayLike
@@ -53,10 +54,18 @@ def clustering_scores(y: ArrayLike, predictions: ArrayLike) -> dict[ClusteringMe
 
 
 class FittedClusterer(Protocol):
-	"""A fitted estimator that assigns cluster labels without being refitted."""
+	"""A fitted baseline estimator that supports scikit-learn cloning and refitting."""
+
+	def get_params(self, *, deep: bool = True) -> dict[str, object]:
+		"""Return the parameters needed to construct an unfitted clone."""
+		...
 
 	def predict(self, data: np.ndarray, /) -> ArrayLike:
 		"""Assign each observation to a fitted cluster."""
+		...
+
+	def fit_predict(self, data: np.ndarray, /) -> ArrayLike:
+		"""Fit the estimator and return its learned partition."""
 		...
 
 
@@ -94,15 +103,17 @@ def get_permutation_importance_scores(
 	permutations_seed: int,
 	disable_progressbar: bool = False,
 ) -> dict[FeatureGroup, dict[ClusteringMetric, np.ndarray]]:
-	"""Return grouped importance for ARI, NMI, and Binder loss with a fixed model.
+	"""Return grouped importance after refitting clustering on each permutation.
 
 	ARI/NMI importance is baseline minus permuted score. Binder importance is
 	permuted minus baseline loss, so positive values always indicate deterioration.
 
 	A single row permutation is applied to all columns in a group, including
-	missing values. The same permutations are reused across groups, as in the
-	colorectal analysis. Neither the imputer/scaler nor the clusterer is refitted.
-	EEE annotations are used only to score predictions. Negative values are kept.
+	missing values. The same permutations are reused across groups. Each permuted
+	dataset is fitted with a fresh clone of the complete clustering pipeline,
+	including imputation and scaling, preserving its parameters and random seed.
+	The fitted baseline estimator is unchanged. EEE annotations are used only to
+	score the resulting partitions. Negative importance values are kept.
 	"""
 	if num_permutations < 1:
 		msg = "num_permutations must be at least 1."
@@ -120,6 +131,8 @@ def get_permutation_importance_scores(
 	if any(not columns for columns in group_columns.values()):
 		msg = "Feature groups must not be empty."
 		raise ValueError(msg)
+	# clone supports get_params-based estimators, but its stubs require BaseEstimator.
+	clone_clusterer = cast("Callable[[FittedClusterer], FittedClusterer]", clone)
 	reference_scores = clustering_scores(y, fitted_clusterer.predict(data.to_numpy()))
 	rng = np.random.default_rng(permutations_seed)
 	permutations = [rng.permutation(data.height) for _ in range(num_permutations)]
@@ -136,7 +149,8 @@ def get_permutation_importance_scores(
 			# with_columns replaces nulls too; update() would retain the original
 			# values at rows whose permuted replacement is null.
 			permuted = data.with_columns(data.select(columns).gather(permutation).get_columns())
-			predictions = fitted_clusterer.predict(permuted.to_numpy())
+			permuted_clusterer = clone_clusterer(fitted_clusterer)
+			predictions = permuted_clusterer.fit_predict(permuted.to_numpy())
 			permuted_scores = clustering_scores(y, predictions)
 			for metric, direction in SCORE_DIRECTIONS.items():
 				differences[metric][index] = direction * (
@@ -181,11 +195,12 @@ def run_clustering(
 	standardize: bool = True,
 	disable_progressbar: bool = False,
 ) -> dict:
-	"""Fit KMeans without labels; score fixed-model permutations against EEE labels.
+	"""Fit KMeans and refit each grouped permutation before scoring against EEE labels.
 
-	The scores and importances describe model reliance on the observed dataset, as in
-	the colorectal final-model calculation. They are not held-out performance or
-	causal effects. Each sample is a simulation, not a parameter-pair majority vote.
+	EEE annotations enter scoring only. Importances compare the original partition
+	with partitions learned after shuffling each feature group, using the same
+	clustering settings and seed. They describe the observed dataset, not held-out
+	performance or causal effects. Each sample is an individual simulation.
 	"""
 	if num_permutations < 1:
 		msg = "num_permutations must be at least 1."
@@ -281,6 +296,7 @@ def run_clustering(
 		"results": summarize_parameter_groups(data, predictions),
 		"final_model_scores": final_scores,
 		"feature_importances_for_ground_truth": importance_records,
+		"permutation_importance_method": "refit_kmeans",
 		"num_permutations": num_permutations,
 		"permutations_seed": permutations_seed,
 		"clustering_seed": clustering_seed,

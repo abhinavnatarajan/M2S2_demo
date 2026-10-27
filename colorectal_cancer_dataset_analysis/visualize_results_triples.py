@@ -21,7 +21,7 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
 	classification_pairs_df = pl.read_parquet(
-		"./colorectal_cancer_dataset_analysis/results/classification_triples_v2/**/*.parquet",
+		"./colorectal_cancer_dataset_analysis/results/classification_triples/**/*.parquet",
 		hive_partitioning=True,
 	).select(
 		"patient_id",
@@ -181,7 +181,12 @@ def _(classification_pairs_df, patient_id_dropdown):
 		height=700,
 		showlegend=False,
 	)
-	mo.vstack([patient_id_dropdown, mo.ui.plotly(feature_importance_chart, config=config)])
+	mo.vstack(
+		[
+			patient_id_dropdown,
+			mo.ui.plotly(feature_importance_chart, config=config),
+		]
+	)
 	return
 
 
@@ -398,9 +403,8 @@ def _(cell_group_importance_by_patient_df, classification_pairs_df):
 			},
 		}
 	)
-	_pca_scatter_data = patient_pca_scores_df.to_dict(as_series=False)
 	patient_pca_scatter = px.scatter_3d(
-		_pca_scatter_data,
+		patient_pca_scores_df,
 		x="PCA1",
 		y="PCA2",
 		z="PCA3",

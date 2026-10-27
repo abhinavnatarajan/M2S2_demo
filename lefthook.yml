@@ -48,5 +48,3 @@ pre-commit:
       stage_fixed: true
     - run: uv run --no-sync --group dev ruff format
       stage_fixed: true
-    # - run: uv run --no-sync --group docs jupyter nbconvert --clear-output --inplace docs/source/example.ipynb
-      # stage_fixed: true
